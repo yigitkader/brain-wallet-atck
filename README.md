@@ -130,6 +130,21 @@ alert_on_find = true
 
 ## 🎮 Usage
 
+### Quick Start with Makefile
+```bash
+# 1. Setup and download dictionaries
+make setup dictionaries
+
+# 2. Build
+make build
+
+# 3. Generate config (if needed)
+./target/release/brainwallet-auditor --generate-config
+
+# 4. Run
+make run
+```
+
 ### Basic Usage
 ```bash
 # Run with default config
@@ -141,11 +156,41 @@ alert_on_find = true
 # Resume from checkpoint
 ./target/release/brainwallet-auditor --resume
 
+# Clear checkpoint and start fresh
+./target/release/brainwallet-auditor --clear-checkpoint
+
 # Limit patterns
 ./target/release/brainwallet-auditor --max-patterns 100000
 
 # Verbose logging
 ./target/release/brainwallet-auditor --verbose
+
+# Generate default config file
+./target/release/brainwallet-auditor --generate-config
+```
+
+### Using Makefile (Recommended)
+```bash
+# Setup environment and download dictionaries
+make setup dictionaries
+
+# Build release binary
+make build
+
+# Run the auditor
+make run
+
+# Run with custom config
+make run-custom
+
+# Run tests
+make test
+
+# Format code
+make fmt
+
+# Lint code
+make lint
 ```
 
 ### Example Output
@@ -190,7 +235,20 @@ Elapsed: 408163.27s
 
 ## 📚 Dictionary Files
 
-### Required Dictionaries
+### Automatic Download (Recommended)
+
+**Dictionary files are automatically downloaded on first run!**
+
+The program will automatically:
+- Download `rockyou.txt` (14M passwords) if missing
+- Download `bip39-english.txt` (2048 BIP39 words) if missing
+- Create default dictionary files for phrases, crypto terms, weak seeds, and names
+
+You don't need to manually download anything - just run the program!
+
+### Manual Download (Optional)
+
+If you prefer to download manually:
 
 **1. RockyOU (14M passwords)**
 ```bash
@@ -204,23 +262,21 @@ wget https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt
 mv english.txt dictionaries/bip39-english.txt
 ```
 
-**3. Create Other Dictionaries**
+**3. Using Makefile**
 ```bash
-# Common phrases
-echo "hello world" > dictionaries/common-phrases.txt
-echo "to be or not to be" >> dictionaries/common-phrases.txt
-
-# Crypto terms
-echo "bitcoin" > dictionaries/crypto-terms.txt
-echo "satoshi" >> dictionaries/crypto-terms.txt
-
-# Known weak seeds (research historical leaks)
-echo "000102030405060708090a0b0c0d0e0f" > dictionaries/known-weak-seeds.txt
-
-# Top names
-echo "john" > dictionaries/top-names.txt
-echo "satoshi" >> dictionaries/top-names.txt
+# Download all required dictionaries
+make dictionaries
 ```
+
+### Dictionary Locations
+
+All dictionaries are stored in the `dictionaries/` directory:
+- `rockyou.txt` - 14M passwords (auto-downloaded)
+- `bip39-english.txt` - 2048 BIP39 words (auto-downloaded)
+- `common-phrases.txt` - Common phrases (auto-created)
+- `crypto-terms.txt` - Crypto vocabulary (auto-created)
+- `known-weak-seeds.txt` - Historical leaks (auto-created)
+- `top-names.txt` - Popular names (auto-created)
 
 ## 🔬 How It Works
 
@@ -386,13 +442,27 @@ Solution: Increase rate_limiting.min_delay_ms in config
 ### Dictionary Not Found
 ```
 Error: Failed to open dictionaries/rockyou.txt
-Solution: Download required dictionaries (see above)
+Solution: 
+  - Dictionaries are auto-downloaded on first run
+  - Or run: make dictionaries
+  - Or manually download (see Dictionary Files section)
 ```
 
 ### Out of Memory
 ```
 Error: Cannot allocate memory
 Solution: Reduce dictionaries.passwords_limit in config
+```
+
+### API Timeouts or Failures
+```
+Error: API request failed
+Solution: 
+  - The program automatically uses fallback APIs
+  - Primary API (BlockCypher) fails -> Fallback to blockchain.com
+  - Increase retries in config:
+    [rate_limiting]
+    max_retries = 5
 ```
 
 ## 🤝 Contributing

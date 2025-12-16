@@ -26,6 +26,9 @@ make setup dictionaries
 make build-optimized
 
 # This creates: target/release/brainwallet-auditor
+
+# Note: Dictionaries will also be auto-downloaded on first run
+# if you skip the 'make dictionaries' step
 ```
 
 ## Step 3: Configure (30 seconds)
@@ -39,9 +42,12 @@ cp config.example.toml config.toml
 nano config.toml
 ```
 
-**Option B: Generate new config**
+**Option B: Generate new config (Recommended)**
 ```bash
-# Generate default config
+# Generate default config using the program
+./target/release/brainwallet-auditor --generate-config
+
+# Or manually create:
 cat > config.toml << 'EOF'
 [attack]
 priorities = ["known_weak", "single_word", "bip39_repeat"]
@@ -110,8 +116,11 @@ EOF
 # Or with custom limits
 ./target/release/brainwallet-auditor --max-patterns 1000000
 
+# Clear checkpoint and start fresh
+./target/release/brainwallet-auditor --clear-checkpoint
+
 # Background mode
-nohup ./target/release/brainwallet-auditor > auditor.log 2>&1 &
+nohup ./target/release/brainwallet-auditor --resume > auditor.log 2>&1 &
 
 # Monitor progress
 tail -f auditor.log
@@ -205,8 +214,11 @@ tail -f scan.log | grep -E "Rate:|Found:"
 
 ### Issue: "Dictionary not found"
 ```bash
-# Download missing dictionaries
+# Dictionaries are auto-downloaded on first run
+# If you see this error, run:
 make dictionaries
+
+# Or the program will download them automatically on next run
 ```
 
 ### Issue: "Rate limited (429)"
@@ -225,8 +237,9 @@ passwords_limit = 100000  # Reduce from 1M
 
 ### Issue: API timeouts
 ```bash
-# Use fallback APIs in balance.rs
-# Or implement retry logic
+# The program automatically uses fallback APIs
+# If primary API fails, it tries blockchain.com automatically
+# Increase retries in config:
 [rate_limiting]
 max_retries = 5  # Increase retries
 ```
@@ -349,8 +362,17 @@ bloom_capacity = 10_000_000  # Reduce if low memory
 # Generate config
 ./target/release/brainwallet-auditor --generate-config
 
-# Dry run (no API calls)
-./target/release/brainwallet-auditor --dry-run --max-patterns 100
+# Resume from checkpoint
+./target/release/brainwallet-auditor --resume
+
+# Clear checkpoint and start fresh
+./target/release/brainwallet-auditor --clear-checkpoint
+
+# Using Makefile
+make run              # Run the auditor
+make test             # Run tests
+make build            # Build release binary
+make dictionaries     # Download dictionaries
 ```
 
 ### Debug Mode
