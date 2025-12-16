@@ -111,15 +111,6 @@ impl AttackPattern {
         }
     }
 
-    /// Get unique hash for bloom filter
-    pub fn hash(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        self.to_string().hash(&mut hasher);
-        hasher.finish()
-    }
 }
 
 impl fmt::Display for AttackPattern {

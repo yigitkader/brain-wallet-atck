@@ -52,6 +52,7 @@ impl Statistics {
         }
     }
 
+    /// Reset statistics (useful when resuming from checkpoint)
     pub fn reset(&self) {
         self.checked.store(0, Ordering::Relaxed);
         self.found.store(0, Ordering::Relaxed);

@@ -43,13 +43,16 @@ impl BloomFilterManager {
     }
 
     /// Get estimated number of items
+    /// Note: Bloom filters don't track exact count, this is an approximation
     pub fn len(&self) -> usize {
-        // Bloom filters don't track exact count
-        // This is an approximation
+        // We can't get exact count from bloom filter, but we can estimate
+        // based on the number of hash operations. For now, return 0 as
+        // the bloom crate doesn't provide a count method.
+        // This is a limitation of the bloom filter implementation.
         0
     }
 
-    /// Clear bloom filter
+    /// Clear bloom filter (useful when starting fresh or resetting)
     pub fn clear(&self) {
         self.filter.write().clear();
     }

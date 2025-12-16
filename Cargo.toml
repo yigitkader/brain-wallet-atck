@@ -6,6 +6,10 @@ authors = ["Security Research Team"]
 description = "Enterprise-grade brainwallet security auditing framework"
 license = "MIT"
 
+[[bin]]
+name = "brainwallet-auditor"
+path = "src/main.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }

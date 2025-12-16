@@ -67,7 +67,7 @@ impl CheckpointManager {
         Ok(Some(checkpoint.last_index))
     }
 
-    /// Delete checkpoint file
+    /// Delete checkpoint file (useful for starting fresh)
     pub fn clear(&self) -> Result<()> {
         if Path::new(&self.path).exists() {
             fs::remove_file(&self.path)?;

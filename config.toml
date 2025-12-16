@@ -1,0 +1,41 @@
+
+[attack]
+priorities = ["known_weak", "single_word", "bip39_repeat"]
+max_patterns = 10_000_000
+resume_from_checkpoint = true
+
+[dictionaries]
+passwords = "dictionaries/rockyou.txt"
+bip39 = "dictionaries/bip39-english.txt"
+phrases = "dictionaries/common-phrases.txt"
+crypto = "dictionaries/crypto-terms.txt"
+weak_seeds = "dictionaries/known-weak-seeds.txt"
+names = "dictionaries/top-names.txt"
+
+passwords_limit = 1_000_000
+phrases_limit = 100_000
+
+[chains]
+enabled = ["BTC", "ETH", "SOL"]
+
+btc_paths = [
+    "m/44'/0'/0'/0/0",   # Legacy
+    "m/49'/0'/0'/0/0",   # SegWit
+    "m/84'/0'/0'/0/0"    # Native SegWit
+]
+
+[rate_limiting]
+min_delay_ms = 1000
+batch_cooldown_ms = 5000
+max_retries = 3
+
+[optimization]
+use_bloom_filter = true
+bloom_capacity = 100_000_000
+use_gpu = false
+batch_size = 1000
+
+[notifications]
+webhook_url = ""
+email = ""
+alert_on_find = true

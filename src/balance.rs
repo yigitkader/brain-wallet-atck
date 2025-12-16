@@ -56,14 +56,24 @@ impl BalanceChecker {
         for address in &wallets.btc {
             self.rate_limit().await;
 
-            match self.check_btc_balance(address).await {
-                Ok(balance) if balance > 0.0 => {
-                    results.btc.insert(address.clone(), balance);
-                }
+            // Try primary API first, fallback to blockchain.com if it fails
+            let balance = match self.check_btc_balance(address).await {
+                Ok(b) => b,
                 Err(e) => {
-                    warn!("Failed to check BTC balance for {}: {}", address, e);
+                    warn!("Primary BTC API failed for {}: {}, trying fallback...", address, e);
+                    // Fallback to blockchain.com API
+                    match self.check_btc_balance_blockchain_com(address).await {
+                        Ok(b) => b,
+                        Err(e2) => {
+                            warn!("Fallback BTC API also failed for {}: {}", address, e2);
+                            0.0
+                        }
+                    }
                 }
-                _ => {}
+            };
+
+            if balance > 0.0 {
+                results.btc.insert(address.clone(), balance);
             }
         }
 

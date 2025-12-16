@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 mod config;
 mod dictionary;
@@ -33,6 +33,10 @@ struct Args {
     #[arg(short, long)]
     resume: bool,
 
+    /// Clear checkpoint and start fresh
+    #[arg(long)]
+    clear_checkpoint: bool,
+
     /// Max patterns to check (overrides config)
     #[arg(short, long)]
     max_patterns: Option<usize>,
@@ -40,6 +44,10 @@ struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Generate default config file and exit
+    #[arg(long)]
+    generate_config: bool,
 }
 
 #[tokio::main]
@@ -47,14 +55,31 @@ async fn main() -> Result<()> {
     // Parse CLI arguments
     let args = Args::parse();
 
+    // Handle --generate-config flag
+    if args.generate_config {
+        let config_content = Config::default_toml();
+        std::fs::write("config.toml", config_content)?;
+        println!("✅ Default config file created: config.toml");
+        return Ok(());
+    }
+
     // Initialize logging
     init_logging(args.verbose)?;
 
     // Display banner
     display_banner();
 
-    // Load configuration
-    let config = Config::load(&args.config)?;
+    // Ensure output directory exists
+    std::fs::create_dir_all("output")?;
+
+    // Load configuration (create default if doesn't exist)
+    let config = if !std::path::Path::new(&args.config).exists() {
+        warn!("Config file not found: {}. Creating default config...", args.config);
+        Config::save_default(&args.config)?;
+        Config::load(&args.config)?
+    } else {
+        Config::load(&args.config)?
+    };
     info!("Configuration loaded from: {}", args.config);
 
     // Override max patterns if specified
@@ -62,6 +87,13 @@ async fn main() -> Result<()> {
 
     // Initialize checkpoint manager
     let checkpoint_manager = CheckpointManager::new("output/checkpoint.json")?;
+    
+    // Clear checkpoint if requested
+    if args.clear_checkpoint {
+        checkpoint_manager.clear()?;
+        info!("Checkpoint cleared, starting fresh");
+    }
+    
     let start_index = if args.resume {
         checkpoint_manager.load()?.unwrap_or(0)
     } else {
@@ -69,12 +101,25 @@ async fn main() -> Result<()> {
     };
 
     info!("Starting from index: {}", start_index);
+    
+    // Initialize statistics
+    let stats = Arc::new(Statistics::new());
+    
+    // Reset statistics if starting fresh (not resuming)
+    if start_index == 0 {
+        stats.reset();
+    }
 
     // Initialize bloom filter (prevent duplicate checks)
     let bloom_filter = BloomFilterManager::new(
         config.optimization.bloom_capacity,
         0.001
     );
+    
+    // Clear bloom filter if starting fresh (not resuming)
+    if start_index == 0 {
+        bloom_filter.clear();
+    }
 
     // Ensure dictionaries are downloaded
     info!("Ensuring dictionaries are available...");
@@ -96,7 +141,6 @@ async fn main() -> Result<()> {
     // Initialize components
     let wallet_generator = WalletGenerator::new(&config)?;
     let balance_checker = BalanceChecker::new(&config).await?;
-    let stats = Arc::new(Statistics::new());
 
     // Main attack loop
     info!("Starting attack loop...");
@@ -175,6 +219,7 @@ async fn main() -> Result<()> {
     info!("Found: {}", stats.found());
     info!("Rate: {:.2} w/s", stats.get_rate());
     info!("Elapsed: {:.2}s", stats.elapsed());
+    info!("Bloom filter entries: ~{}", bloom_filter.len());
     info!("═══════════════════════════════════════════════");
 
     Ok(())
