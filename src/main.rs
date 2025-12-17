@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     let stats = Arc::new(Statistics::new());
     
     // Reset statistics if starting fresh (not resuming)
-    if start_index == 0 {
+    if !args.resume || start_index == 0 {
         stats.reset();
     }
 
@@ -186,7 +186,11 @@ async fn main() -> Result<()> {
         if bloom_filter.contains(&pattern) {
             continue;
         }
-        bloom_filter.add(&pattern);
+        // Add to bloom filter (with capacity check)
+        if let Err(e) = bloom_filter.add(&pattern) {
+            warn!("Bloom filter capacity exceeded: {}. Continuing without bloom filter...", e);
+            // Continue without bloom filter (will check duplicates less efficiently)
+        }
 
         // Generate wallet from pattern
         let wallets = match wallet_generator.generate(&pattern) {
@@ -203,6 +207,7 @@ async fn main() -> Result<()> {
             Err(e) => {
                 warn!("Balance check failed for pattern {}: {}", pattern, e);
                 // Continue processing, don't crash
+                // Don't increment checked count if balance check completely failed
                 continue;
             }
         };

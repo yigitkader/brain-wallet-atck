@@ -1,4 +1,4 @@
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -65,8 +65,10 @@ impl BalanceChecker {
                     match self.check_btc_balance_blockchain_com(address).await {
                         Ok(b) => b,
                         Err(e2) => {
-                            warn!("Fallback BTC API also failed for {}: {}", address, e2);
-                            0.0
+                            warn!("Both BTC APIs failed for {}: primary={}, fallback={}", address, e, e2);
+                            // Don't mark as checked if both APIs failed
+                            // Return error to prevent silent failure
+                            return Err(anyhow::anyhow!("Both BTC APIs failed: primary={}, fallback={}", e, e2));
                         }
                     }
                 }
@@ -115,7 +117,10 @@ impl BalanceChecker {
             .context("Failed to fetch BTC balance")?;
 
         if !response.status().is_success() {
-            return Ok(0.0);
+            if response.status() == 429 {
+                bail!("Rate limited (429) - increase delays in config");
+            }
+            bail!("API error: {} - {}", response.status(), url);
         }
 
         let data: BlockCypherResponse = response.json().await?;
@@ -189,7 +194,10 @@ impl BalanceChecker {
             .context("Failed to fetch SOL balance")?;
 
         if !response.status().is_success() {
-            return Ok(0.0);
+            if response.status() == 429 {
+                bail!("Rate limited (429) - increase delays in config");
+            }
+            bail!("API error: {} - Solana RPC", response.status());
         }
 
         let data: RpcResponse = response.json().await?;
@@ -236,7 +244,10 @@ impl BalanceChecker {
             .await?;
 
         if !response.status().is_success() {
-            return Ok(0.0);
+            if response.status() == 429 {
+                bail!("Rate limited (429) - increase delays in config");
+            }
+            bail!("API error: {} - {}", response.status(), url);
         }
 
         let data: BlockchainResponse = response.json().await?;

@@ -5,7 +5,7 @@
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,14 +45,17 @@ impl CheckpointManager {
         let temp_path = format!("{}.tmp", self.path);
         let file = File::create(&temp_path)
             .context("Failed to create temp checkpoint file")?;
-        let writer = BufWriter::new(file);
+        let mut writer = BufWriter::new(file);
 
-        serde_json::to_writer_pretty(writer, &checkpoint)
+        serde_json::to_writer_pretty(&mut writer, &checkpoint)
             .context("Failed to write checkpoint")?;
-
-        // Flush and sync to ensure data is written to disk
-        // Note: BufWriter is dropped here, which flushes automatically
-        // The file is already written, sync is handled by the OS on rename
+        
+        // Explicit flush to ensure data is written to disk before rename
+        writer.flush()
+            .context("Failed to flush checkpoint buffer")?;
+        
+        // Drop writer to close file handle
+        drop(writer);
 
         // Atomic rename (POSIX guarantees this is atomic)
         std::fs::rename(&temp_path, &self.path)

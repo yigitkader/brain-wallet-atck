@@ -70,10 +70,24 @@ pub struct OptimizationConfig {
     pub bloom_capacity: usize,
 
     /// Use GPU acceleration (requires CUDA)
+    #[serde(default)]
     pub use_gpu: bool,
 
     /// Batch size for GPU
+    #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// Max password combinations for PasswordNumber pattern (prevents memory explosion)
+    #[serde(default = "default_max_password_combinations")]
+    pub max_password_combinations: usize,
+}
+
+fn default_batch_size() -> usize {
+    1000
+}
+
+fn default_max_password_combinations() -> usize {
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +171,7 @@ use_bloom_filter = true
 bloom_capacity = 100_000_000
 use_gpu = false
 batch_size = 1000
+max_password_combinations = 100
 
 [notifications]
 webhook_url = ""
@@ -213,6 +228,7 @@ impl Default for Config {
                 bloom_capacity: 100_000_000,
                 use_gpu: false,
                 batch_size: 1000,
+                max_password_combinations: 100,
             },
             notifications: NotificationConfig {
                 webhook_url: None,

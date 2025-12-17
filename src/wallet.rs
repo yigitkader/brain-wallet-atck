@@ -139,7 +139,11 @@ impl WalletGenerator {
         let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&self.secp, &secret_key);
 
         // Ethereum address = last 20 bytes of keccak256(public_key)
-        let pub_bytes = &public_key.serialize_uncompressed()[1..]; // Remove 0x04 prefix
+        // serialize_uncompressed() returns 65 bytes: 0x04 (1 byte) + X (32 bytes) + Y (32 bytes)
+        let pub_bytes_full = public_key.serialize_uncompressed();
+        assert_eq!(pub_bytes_full.len(), 65, "Public key must be 65 bytes (0x04 + 64 bytes)");
+        let pub_bytes = &pub_bytes_full[1..65]; // Remove 0x04 prefix, get exactly 64 bytes
+        assert_eq!(pub_bytes.len(), 64, "Public key must be exactly 64 bytes for Ethereum");
         let hash = Self::keccak256(pub_bytes);
         let address = hex::encode(&hash[12..]);
 

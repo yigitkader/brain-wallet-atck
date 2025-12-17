@@ -192,10 +192,17 @@ impl PatternGenerator {
             });
         }
 
+        // 5b. Crypto terms as passphrases (MEDIUM)
+        for term in &dictionaries.crypto {
+            patterns.push(AttackPattern::PhrasePassphrase {
+                phrase: term.clone(),
+            });
+        }
+
         // 6. Password + number combinations (MEDIUM)
-        // Limit to prevent memory explosion: top 100 passwords with numbers 0-999
-        // This generates 100 * 1000 = 100K patterns instead of 10M
-        for password in dictionaries.passwords.iter().take(100) {
+        // Use config limit to prevent memory explosion
+        let max_password_combinations = config.optimization.max_password_combinations;
+        for password in dictionaries.passwords.iter().take(max_password_combinations) {
             for number in 0..1000 {
                 patterns.push(AttackPattern::PasswordNumber {
                     password: password.clone(),
@@ -215,7 +222,9 @@ impl PatternGenerator {
         }
 
         // Add pattern mutations (leetspeak, case variations, etc.)
-        patterns.extend(Self::generate_mutations(&dictionaries.passwords.iter().take(100).cloned().collect::<Vec<_>>()));
+        // Use same limit as password combinations to be consistent
+        let mutation_limit = config.optimization.max_password_combinations.min(100);
+        patterns.extend(Self::generate_mutations(&dictionaries.passwords.iter().take(mutation_limit).cloned().collect::<Vec<_>>()));
 
         Ok(patterns)
     }

@@ -6,10 +6,12 @@ use bloom::{BloomFilter as InternalBloom, ASMS};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
+use anyhow::Result;
 
 pub struct BloomFilterManager {
     filter: parking_lot::RwLock<InternalBloom>,
     item_count: AtomicU64, // Manual counter for accurate statistics
+    capacity: usize, // Maximum capacity to prevent overflow
 }
 
 impl BloomFilterManager {
@@ -23,6 +25,7 @@ impl BloomFilterManager {
         Self {
             filter: parking_lot::RwLock::new(filter),
             item_count: AtomicU64::new(0),
+            capacity,
         }
     }
 
@@ -32,11 +35,17 @@ impl BloomFilterManager {
         self.filter.read().contains(&hash)
     }
 
-    /// Add pattern to bloom filter
-    pub fn add<T: Hash>(&self, item: &T) {
+    /// Add pattern to bloom filter (with capacity check)
+    pub fn add<T: Hash>(&self, item: &T) -> Result<()> {
+        let current_count = self.item_count.load(Ordering::Relaxed);
+        if current_count >= self.capacity as u64 {
+            anyhow::bail!("Bloom filter capacity exceeded: {} (max: {})", current_count, self.capacity);
+        }
+        
         let hash = Self::hash_item(item);
         self.filter.write().insert(&hash);
         self.item_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Hash any item to u64
