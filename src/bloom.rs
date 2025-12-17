@@ -89,7 +89,7 @@ mod tests {
         let item1 = "test1";
         let item2 = "test2";
 
-        bloom.add(&item1);
+        bloom.add(&item1).unwrap();
         assert!(bloom.contains(&item1));
         assert!(!bloom.contains(&item2));
     }
