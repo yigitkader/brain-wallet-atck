@@ -21,7 +21,7 @@ use crate::balance::BalanceChecker;
 use crate::stats::Statistics;
 use crate::checkpoint::CheckpointManager;
 use crate::bloom::BloomFilterManager;
-use crate::notifications::NotificationManager;
+use crate::notifications::log_wallet_found;
 
 /// Enterprise-grade brainwallet security auditor
 #[derive(Parser, Debug)]
@@ -143,7 +143,6 @@ async fn main() -> Result<()> {
     // Initialize components
     let wallet_generator = WalletGenerator::new(&config)?;
     let balance_checker = BalanceChecker::new(&config).await?;
-    let notification_manager = NotificationManager::new(config.notifications.clone());
 
     // Main attack loop
     info!("Starting attack loop...");
@@ -183,18 +182,15 @@ async fn main() -> Result<()> {
         // Update statistics
         stats.increment_checked();
 
-        // Found a wallet with balance!
+        // Found a wallet with balance > 0!
         if !results.is_empty() {
             stats.increment_found();
-            info!("🎉 FOUND WALLET WITH BALANCE!");
-            info!("Pattern: {:?}", pattern);
-            info!("Results: {:?}", results);
+            
+            // Log with colored output
+            log_wallet_found(&pattern, &wallets, &results)?;
 
-            // Save hit to file
+            // Save hit to file with all details
             save_hit(&pattern, &wallets, &results).await?;
-
-            // Send notifications
-            notification_manager.notify_wallet_found(&pattern, &wallets, &results).await?;
         }
 
         // Update progress
@@ -279,6 +275,7 @@ fn init_logging(verbose: bool) -> Result<()> {
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true)
+        .with_ansi(true) // Enable ANSI color codes
         .init();
 
     Ok(())

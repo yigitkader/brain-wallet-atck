@@ -20,4 +20,4 @@ pub use balance::{BalanceChecker, BalanceResults};
 pub use stats::Statistics;
 pub use checkpoint::CheckpointManager;
 pub use bloom::BloomFilterManager;
-pub use notifications::NotificationManager;
+pub use notifications::log_wallet_found;

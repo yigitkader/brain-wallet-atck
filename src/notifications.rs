@@ -1,114 +1,82 @@
 // ============================================================================
-// notifications.rs - Webhook and Email Notifications
+// notifications.rs - Logging for Found Wallets
 // ============================================================================
 
 use anyhow::Result;
-use reqwest::Client;
-use serde::Serialize;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::config::NotificationConfig;
 use crate::pattern::AttackPattern;
 use crate::wallet::WalletAddresses;
 use crate::balance::BalanceResults;
 
-/// Notification manager for webhooks and emails
-pub struct NotificationManager {
-    config: NotificationConfig,
-    client: Client,
-}
+/// Log wallet findings with detailed information
+pub fn log_wallet_found(
+    pattern: &AttackPattern,
+    wallets: &WalletAddresses,
+    balances: &BalanceResults,
+) -> Result<()> {
+    // Calculate total balance
+    let mut total_btc = 0.0;
+    for balance in balances.btc.values() {
+        total_btc += balance;
+    }
+    let total_eth = balances.eth.unwrap_or(0.0);
+    let total_sol = balances.sol.unwrap_or(0.0);
+    let total_value = total_btc + total_eth + total_sol;
 
-impl NotificationManager {
-    pub fn new(config: NotificationConfig) -> Self {
-        Self {
-            config,
-            client: Client::new(),
+    // Use ANSI color codes for highlighting
+    // Green for high value, yellow for medium, red for low
+    let color_code = if total_value > 1.0 {
+        "\x1b[92m" // Bright green for high value
+    } else if total_value > 0.1 {
+        "\x1b[93m" // Bright yellow for medium value
+    } else {
+        "\x1b[91m" // Bright red for low value
+    };
+    let reset_code = "\x1b[0m";
+
+    info!(
+        "{}═══════════════════════════════════════════════════════════{}",
+        color_code, reset_code
+    );
+    info!(
+        "{}🎉 WALLET FOUND WITH BALANCE! 🎉{}",
+        color_code, reset_code
+    );
+    info!(
+        "{}═══════════════════════════════════════════════════════════{}",
+        color_code, reset_code
+    );
+    info!("{}Pattern Type: {}{}", color_code, pattern.pattern_type(), reset_code);
+    info!("{}Pattern: {}{}", color_code, pattern, reset_code);
+    info!("{}Priority: {}{}", color_code, pattern.priority(), reset_code);
+    info!("{}─────────────────────────────────────────────────────────{}", color_code, reset_code);
+    
+    if !balances.btc.is_empty() {
+        info!("{}Bitcoin Wallets:{}", color_code, reset_code);
+        for (address, balance) in &balances.btc {
+            info!("{}  {}: {:.8} BTC{}", color_code, address, balance, reset_code);
         }
     }
-
-    /// Send notification when wallet is found
-    pub async fn notify_wallet_found(
-        &self,
-        pattern: &AttackPattern,
-        wallets: &WalletAddresses,
-        balances: &BalanceResults,
-    ) -> Result<()> {
-        if !self.config.alert_on_find {
-            return Ok(());
-        }
-
-        let message = format!(
-            "🎉 Wallet Found!\n\nPattern: {}\nType: {}\nPriority: {}\n\nWallets:\nBTC: {:?}\nETH: {}\nSOL: {:?}\n\nBalances:\n{:?}",
-            pattern,
-            pattern.pattern_type(),
-            pattern.priority(),
-            wallets.btc,
-            wallets.eth,
-            wallets.sol,
-            balances
-        );
-
-        // Send webhook if configured
-        if let Some(ref webhook_url) = self.config.webhook_url {
-            if !webhook_url.is_empty() {
-                self.send_webhook(webhook_url, &message).await?;
-            }
-        }
-
-        // Send email if configured
-        if let Some(ref email) = self.config.email {
-            if !email.is_empty() {
-                self.send_email(email, &message).await?;
-            }
-        }
-
-        Ok(())
+    
+    if let Some(eth_balance) = balances.eth {
+        info!("{}Ethereum Wallet: {}: {:.8} ETH{}", color_code, wallets.eth, eth_balance, reset_code);
     }
-
-    /// Send webhook notification
-    async fn send_webhook(&self, url: &str, message: &str) -> Result<()> {
-        #[derive(Serialize)]
-        struct WebhookPayload {
-            content: String,
+    
+    if let Some(sol_balance) = balances.sol {
+        if let Some(sol_address) = &wallets.sol {
+            info!("{}Solana Wallet: {}: {:.8} SOL{}", color_code, sol_address, sol_balance, reset_code);
         }
-
-        let payload = WebhookPayload {
-            content: message.to_string(),
-        };
-
-        match self.client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    info!("Webhook notification sent successfully");
-                } else {
-                    warn!("Webhook notification failed: {}", response.status());
-                }
-            }
-            Err(e) => {
-                warn!("Failed to send webhook: {}", e);
-            }
-        }
-
-        Ok(())
     }
+    
+    info!("{}─────────────────────────────────────────────────────────{}", color_code, reset_code);
+    info!("{}Total Value: {:.8} (BTC: {:.8}, ETH: {:.8}, SOL: {:.8}){}", 
+        color_code, total_value, total_btc, total_eth, total_sol, reset_code);
+    info!(
+        "{}═══════════════════════════════════════════════════════════{}",
+        color_code, reset_code
+    );
 
-    /// Send email notification (simplified - uses webhook or logs)
-    async fn send_email(&self, _email: &str, message: &str) -> Result<()> {
-        // For now, we'll log the email notification
-        // In production, you'd use an email service like SendGrid, SES, etc.
-        info!("Email notification (to {}): {}", _email, message);
-        
-        // TODO: Implement actual email sending using a service like:
-        // - SendGrid
-        // - AWS SES
-        // - SMTP server
-        
-        Ok(())
-    }
+    Ok(())
 }
 

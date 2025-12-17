@@ -161,10 +161,6 @@ impl WalletGenerator {
     }
 }
 
-// Need to add tiny-keccak to Cargo.toml:
-// tiny-keccak = { version = "2.0", features = ["keccak"] }
-// bs58 = "0.5"
-
 #[cfg(test)]
 mod tests {
     use super::*;
