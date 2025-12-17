@@ -516,9 +516,8 @@ brainwallet-auditor/
 │   ├── checkpoint.rs       ✅ Resume capability
 │   └── bloom.rs            ✅ Duplicate prevention
 │
-├── dictionaries/           ✅ Attack dictionaries
+├── dictionaries/           ✅ Attack dictionaries (auto-created)
 ├── output/                 ✅ Results & checkpoints
-└── scripts/                ✅ Helper scripts
 🚀 Key Features (Enterprise-Grade)
 FeatureStatusDescriptionMulti-Chain✅BTC (3 paths), ETH, SOL7 Attack Strategies✅Prioritized patternsResume/Checkpoint✅Never lose progressBloom Filter✅No duplicate checksRate Limiting✅API-friendlyReal-time Stats✅Live monitoringError Handling✅Production-readyLogging✅Tracing frameworkDocker Support✅ContainerizedCI/CD Pipeline✅GitHub ActionsBenchmarks✅Performance testsDocumentation✅Complete guides
 🎯 Attack Strategies (Implemented)

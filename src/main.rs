@@ -11,6 +11,7 @@ mod balance;
 mod stats;
 mod checkpoint;
 mod bloom;
+mod notifications;
 
 use crate::config::Config;
 use crate::dictionary::DictionaryLoader;
@@ -20,6 +21,7 @@ use crate::balance::BalanceChecker;
 use crate::stats::Statistics;
 use crate::checkpoint::CheckpointManager;
 use crate::bloom::BloomFilterManager;
+use crate::notifications::NotificationManager;
 
 /// Enterprise-grade brainwallet security auditor
 #[derive(Parser, Debug)]
@@ -141,6 +143,7 @@ async fn main() -> Result<()> {
     // Initialize components
     let wallet_generator = WalletGenerator::new(&config)?;
     let balance_checker = BalanceChecker::new(&config).await?;
+    let notification_manager = NotificationManager::new(config.notifications.clone());
 
     // Main attack loop
     info!("Starting attack loop...");
@@ -189,6 +192,9 @@ async fn main() -> Result<()> {
 
             // Save hit to file
             save_hit(&pattern, &wallets, &results).await?;
+
+            // Send notifications
+            notification_manager.notify_wallet_found(&pattern, &wallets, &results).await?;
         }
 
         // Update progress
@@ -198,8 +204,8 @@ async fn main() -> Result<()> {
             info!("Progress: {} | Rate: {:.2} w/s | Found: {}", 
                 i, rate, stats.found());
 
-            // Save checkpoint
-            checkpoint_manager.save(i)?;
+            // Save checkpoint with stats
+            checkpoint_manager.save(i, stats.checked(), stats.found())?;
         }
 
         // Rate limiting
@@ -213,6 +219,17 @@ async fn main() -> Result<()> {
     progress_bar.finish_with_message("Attack completed");
 
     // Final statistics
+    let final_stats = serde_json::json!({
+        "checked": stats.checked(),
+        "found": stats.found(),
+        "rate": stats.get_rate(),
+        "elapsed_seconds": stats.elapsed(),
+        "bloom_filter_entries": bloom_filter.len(),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "start_index": start_index,
+        "max_patterns": max_patterns,
+    });
+
     info!("═══════════════════════════════════════════════");
     info!("FINAL STATISTICS:");
     info!("Checked: {}", stats.checked());
@@ -221,6 +238,20 @@ async fn main() -> Result<()> {
     info!("Elapsed: {:.2}s", stats.elapsed());
     info!("Bloom filter entries: ~{}", bloom_filter.len());
     info!("═══════════════════════════════════════════════");
+
+    // Save final statistics to file
+    std::fs::write(
+        "output/stats.json",
+        serde_json::to_string_pretty(&final_stats)?
+    )?;
+    info!("Statistics saved to output/stats.json");
+
+    // Save final checkpoint
+    checkpoint_manager.save(
+        max_patterns.min(patterns.len()),
+        stats.checked(),
+        stats.found()
+    )?;
 
     Ok(())
 }

@@ -33,11 +33,11 @@ impl CheckpointManager {
     }
 
     /// Save checkpoint to file
-    pub fn save(&self, index: usize) -> Result<()> {
+    pub fn save(&self, index: usize, checked: u64, found: u64) -> Result<()> {
         let checkpoint = Checkpoint {
             last_index: index,
-            checked: 0, // Will be filled by caller
-            found: 0,
+            checked,
+            found,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 

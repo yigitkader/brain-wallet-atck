@@ -49,10 +49,8 @@ dictionaries:
 			-O dictionaries/bip39-english.txt; \
 	fi
 
-	# Create sample dictionaries
-	@./scripts/generate_sample_dicts.sh
-
 	@echo "✅ Dictionaries ready!"
+	@echo "ℹ️  Note: Other dictionaries will be auto-created on first run"
 
 # Build release binary
 build:
@@ -88,12 +86,18 @@ bench:
 # Run the auditor
 run:
 	@echo "🎯 Starting Brainwallet Security Auditor..."
+	@echo "ℹ️  Note: Config file will be auto-generated if missing"
 	@cargo run --release
 
 # Run with custom config
 run-custom:
 	@echo "🎯 Starting with custom config..."
+	@if [ ! -f custom-config.toml ]; then \
+		echo "❌ Error: custom-config.toml not found"; \
+		exit 1; \
+	fi
 	@cargo run --release -- --config custom-config.toml
+
 
 # Run in development mode (with auto-reload)
 dev:
@@ -155,23 +159,29 @@ install:
 # Create release package
 package:
 	@echo "📦 Creating release package..."
+	@if [ ! -f target/release/brainwallet-auditor ]; then \
+		echo "⚠️  Binary not found. Building first..."; \
+		make build; \
+	fi
 	@mkdir -p releases
-	@tar czf releases/brainwallet-auditor-$(shell git describe --tags).tar.gz \
-		target/release/brainwallet-auditor \
-		config.toml \
-		README.md \
-		LICENSE
-	@echo "✅ Package: releases/brainwallet-auditor-$(shell git describe --tags).tar.gz"
+	@if [ -f LICENSE ]; then \
+		tar czf releases/brainwallet-auditor-$(shell git describe --tags 2>/dev/null || echo "v1.0.0").tar.gz \
+			target/release/brainwallet-auditor \
+			config.toml \
+			README.md \
+			LICENSE; \
+	else \
+		tar czf releases/brainwallet-auditor-$(shell git describe --tags 2>/dev/null || echo "v1.0.0").tar.gz \
+			target/release/brainwallet-auditor \
+			config.toml \
+			README.md; \
+	fi
+	@echo "✅ Package: releases/brainwallet-auditor-$(shell git describe --tags 2>/dev/null || echo "v1.0.0").tar.gz"
 
 # CI/CD targets
 ci: setup build test lint audit
 	@echo "✅ CI pipeline passed!"
 
-# Generate sample config
-config:
-	@echo "⚙️ Generating default config..."
-	@./target/release/brainwallet-auditor --generate-config > config.toml
-	@echo "✅ Config saved to config.toml"
 
 # Check for updates
 update:
