@@ -15,6 +15,8 @@ pub struct Checkpoint {
     pub checked: u64,
     pub found: u64,
     pub timestamp: String,
+    #[serde(default)] // Backward compatibility: if missing, use current time
+    pub start_time: Option<u64>, // Unix timestamp in seconds (for accurate rate calculation when resuming)
 }
 
 pub struct CheckpointManager {
@@ -34,12 +36,21 @@ impl CheckpointManager {
     }
 
     /// Save checkpoint to file (atomic write with file locking to prevent corruption)
-    pub fn save(&self, index: usize, checked: u64, found: u64) -> Result<()> {
+    /// start_time: Unix timestamp in seconds (None = use current time, Some(t) = preserve original start time)
+    pub fn save(&self, index: usize, checked: u64, found: u64, start_time: Option<u64>) -> Result<()> {
+        // Preserve original start_time from previous checkpoint if it exists, otherwise use provided or current time
+        let preserved_start_time = if let Some(prev_checkpoint) = self.load_full().ok().flatten() {
+            prev_checkpoint.start_time.or(start_time)
+        } else {
+            start_time
+        };
+        
         let checkpoint = Checkpoint {
             last_index: index,
             checked,
             found,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            start_time: preserved_start_time,
         };
 
         // Atomic write pattern: write to temp file first, then rename

@@ -72,9 +72,18 @@ impl Statistics {
     }
 
     /// Restore statistics from checkpoint (useful when resuming)
-    pub fn restore(&self, checked: u64, found: u64) {
+    /// start_time: Unix timestamp in seconds (None = keep current start_time, Some(t) = restore original start time)
+    pub fn restore(&self, checked: u64, found: u64, start_time: Option<u64>) {
         self.checked.store(checked, Ordering::Relaxed);
         self.found.store(found, Ordering::Relaxed);
-        // Don't reset start_time - keep original start time for accurate rate calculation
+        // Restore original start_time if provided, for accurate rate calculation when resuming
+        if let Some(original_start) = start_time {
+            self.start_time.store(original_start, Ordering::Relaxed);
+        }
+    }
+    
+    /// Get start time (for checkpoint saving)
+    pub fn start_time(&self) -> u64 {
+        self.start_time.load(Ordering::Relaxed)
     }
 }

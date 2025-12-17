@@ -99,9 +99,9 @@ async fn main() -> Result<()> {
     // Load checkpoint data (index and statistics)
     let (start_index, checkpoint_stats) = if args.resume {
         if let Some(checkpoint) = checkpoint_manager.load_full()? {
-            info!("Resuming from checkpoint: index={}, checked={}, found={}", 
-                  checkpoint.last_index, checkpoint.checked, checkpoint.found);
-            (checkpoint.last_index, Some((checkpoint.checked, checkpoint.found)))
+            info!("Resuming from checkpoint: index={}, checked={}, found={}, start_time={:?}", 
+                  checkpoint.last_index, checkpoint.checked, checkpoint.found, checkpoint.start_time);
+            (checkpoint.last_index, Some((checkpoint.checked, checkpoint.found, checkpoint.start_time)))
         } else {
             (0, None)
         }
@@ -115,9 +115,13 @@ async fn main() -> Result<()> {
     let stats = Arc::new(Statistics::new());
     
     // Restore statistics from checkpoint if resuming, otherwise reset
-    if let Some((checked, found)) = checkpoint_stats {
-        stats.restore(checked, found);
-        info!("Restored statistics: checked={}, found={}", checked, found);
+    if let Some((checked, found, start_time)) = checkpoint_stats {
+        stats.restore(checked, found, start_time);
+        if let Some(original_start) = start_time {
+            info!("Restored statistics: checked={}, found={}, original_start_time={}", checked, found, original_start);
+        } else {
+            info!("Restored statistics: checked={}, found={} (start_time not preserved)", checked, found);
+        }
     } else {
         stats.reset();
     }
@@ -183,7 +187,7 @@ async fn main() -> Result<()> {
         // Check for shutdown signal (non-blocking)
         if shutdown_rx.try_recv().is_ok() {
             info!("Shutdown signal received, saving checkpoint...");
-            checkpoint_manager.save(i, stats.checked(), stats.found())?;
+            checkpoint_manager.save(i, stats.checked(), stats.found(), Some(stats.start_time()))?;
             info!("✅ Checkpoint saved, exiting gracefully...");
             return Ok(());
         }
@@ -258,7 +262,7 @@ async fn main() -> Result<()> {
 
         // Save checkpoint less frequently (every 5000 patterns or on hit)
         if i % 5000 == 0 || !results.is_empty() {
-            checkpoint_manager.save(i, stats.checked(), stats.found())?;
+            checkpoint_manager.save(i, stats.checked(), stats.found(), Some(stats.start_time()))?;
         }
 
         // Rate limiting
@@ -303,7 +307,8 @@ async fn main() -> Result<()> {
     checkpoint_manager.save(
         max_patterns.min(patterns.len()),
         stats.checked(),
-        stats.found()
+        stats.found(),
+        Some(stats.start_time())
     )?;
 
     Ok(())
