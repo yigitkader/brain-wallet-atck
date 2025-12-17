@@ -36,17 +36,32 @@ dictionaries:
 	@mkdir -p dictionaries
 
 	# RockyOU password list (14M passwords)
-	@if [ ! -f dictionaries/rockyou.txt ]; then \
-		echo "Downloading rockyou.txt..."; \
-		wget -q --show-progress https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt \
-			-O dictionaries/rockyou.txt; \
-	fi
+	# Note: Dictionary will be auto-downloaded by the program with fallback URLs
+	@echo "ℹ️  Note: rockyou.txt will be auto-downloaded on first run with fallback URLs"
 
 	# BIP39 English wordlist
 	@if [ ! -f dictionaries/bip39-english.txt ]; then \
 		echo "Downloading BIP39 wordlist..."; \
-		wget -q --show-progress https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt \
-			-O dictionaries/bip39-english.txt; \
+		if command -v curl > /dev/null 2>&1; then \
+			curl -L --max-time 30 --retry 3 --retry-delay 2 \
+				https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt \
+				-o dictionaries/bip39-english.txt || \
+			(echo "❌ Error: Failed to download BIP39 wordlist"; exit 1); \
+		elif command -v wget > /dev/null 2>&1; then \
+			wget -q --show-progress --tries=3 --timeout=30 \
+				https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt \
+				-O dictionaries/bip39-english.txt || \
+			(echo "❌ Error: Failed to download BIP39 wordlist"; exit 1); \
+		else \
+			echo "❌ Error: Neither curl nor wget found. Please install one of them."; \
+			exit 1; \
+		fi \
+	fi
+
+	# Verify downloaded files
+	@if [ ! -s dictionaries/bip39-english.txt ]; then \
+		echo "❌ Error: BIP39 wordlist is empty or missing"; \
+		exit 1; \
 	fi
 
 	@echo "✅ Dictionaries ready!"

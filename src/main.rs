@@ -156,7 +156,28 @@ async fn main() -> Result<()> {
             .progress_chars("#>-")
     );
 
+    // Setup CTRL+C handler for graceful shutdown
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let shutdown_tx_clone = shutdown_tx.clone();
+    
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!("Failed to listen for Ctrl+C: {}", e);
+            return;
+        }
+        info!("\n🛑 Received Ctrl+C, saving checkpoint and shutting down gracefully...");
+        shutdown_tx_clone.send(()).await.ok();
+    });
+
     for (i, pattern) in patterns.iter().enumerate().skip(start_index) {
+        // Check for shutdown signal (non-blocking)
+        if shutdown_rx.try_recv().is_ok() {
+            info!("Shutdown signal received, saving checkpoint...");
+            checkpoint_manager.save(i, stats.checked(), stats.found())?;
+            info!("✅ Checkpoint saved, exiting gracefully...");
+            return Ok(());
+        }
+
         if i >= max_patterns {
             break;
         }
@@ -200,14 +221,16 @@ async fn main() -> Result<()> {
             save_hit(&pattern, &wallets, &results).await?;
         }
 
-        // Update progress
+        // Update progress (less frequent checkpoint to reduce disk I/O)
         if i % 100 == 0 {
             progress_bar.set_position(i as u64);
             let rate = stats.get_rate();
             info!("Progress: {} | Rate: {:.2} w/s | Found: {}", 
                 i, rate, stats.found());
+        }
 
-            // Save checkpoint with stats
+        // Save checkpoint less frequently (every 5000 patterns or on hit)
+        if i % 5000 == 0 || !results.is_empty() {
             checkpoint_manager.save(i, stats.checked(), stats.found())?;
         }
 
@@ -311,12 +334,14 @@ async fn save_hit(
         "balances": results,
     });
 
+    // Use NDJSON format (newline-delimited JSON) for better parsing
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("output/found_wallets.json")?;
+        .open("output/found_wallets.ndjson")?;
 
-    writeln!(file, "{}", serde_json::to_string_pretty(&hit)?)?;
+    // Compact JSON (not pretty) for NDJSON format
+    writeln!(file, "{}", serde_json::to_string(&hit)?)?;
 
     Ok(())
 }
