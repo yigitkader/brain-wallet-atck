@@ -197,4 +197,73 @@ mod tests {
         assert!(manager.load().unwrap().is_none());
         assert!(manager.load_full().unwrap().is_none());
     }
+
+    /// Test checkpoint corruption handling
+    /// Verifies that corrupted checkpoint files are handled gracefully
+    #[test]
+    fn test_checkpoint_corruption() {
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join("corrupted_checkpoint.json");
+        let manager = CheckpointManager::new(checkpoint_path.to_str().unwrap()).unwrap();
+
+        // Create a corrupted checkpoint file (invalid JSON)
+        std::fs::write(&checkpoint_path, "invalid json content {").unwrap();
+
+        // Loading corrupted checkpoint should return an error
+        let result = manager.load_full();
+        assert!(result.is_err(), "Loading corrupted checkpoint should fail");
+        
+        // Verify error message mentions parsing
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("parse") || error_msg.contains("Failed to parse"), 
+                "Error should mention parsing failure, got: {}", error_msg);
+    }
+
+    /// Test checkpoint with missing fields (backward compatibility)
+    #[test]
+    fn test_checkpoint_missing_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join("old_checkpoint.json");
+        let manager = CheckpointManager::new(checkpoint_path.to_str().unwrap()).unwrap();
+
+        // Create checkpoint with missing start_time field (old format)
+        let old_checkpoint = r#"{
+            "last_index": 100,
+            "checked": 50,
+            "found": 2,
+            "timestamp": "2024-01-01T00:00:00Z"
+        }"#;
+        std::fs::write(&checkpoint_path, old_checkpoint).unwrap();
+
+        // Should load successfully (start_time has default value)
+        let checkpoint = manager.load_full().unwrap();
+        assert!(checkpoint.is_some(), "Should load checkpoint with missing start_time");
+        
+        let cp = checkpoint.unwrap();
+        assert_eq!(cp.last_index, 100);
+        assert_eq!(cp.checked, 50);
+        assert_eq!(cp.found, 2);
+        assert_eq!(cp.start_time, None, "Missing start_time should default to None");
+    }
+
+    /// Test checkpoint atomic write (prevents corruption during write)
+    #[test]
+    fn test_checkpoint_atomic_write() {
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join("atomic_checkpoint.json");
+        let manager = CheckpointManager::new(checkpoint_path.to_str().unwrap()).unwrap();
+
+        // Save checkpoint (uses atomic write: temp file + rename)
+        manager.save(100, 50, 2, Some(1234567890)).unwrap();
+
+        // Verify checkpoint was written correctly
+        let checkpoint = manager.load_full().unwrap().unwrap();
+        assert_eq!(checkpoint.last_index, 100);
+        assert_eq!(checkpoint.checked, 50);
+        assert_eq!(checkpoint.found, 2);
+
+        // Verify temp file doesn't exist (should be cleaned up)
+        let temp_path = format!("{}.tmp", checkpoint_path.to_str().unwrap());
+        assert!(!Path::new(&temp_path).exists(), "Temp file should be cleaned up after atomic write");
+    }
 }

@@ -97,28 +97,43 @@ impl DictionaryLoader {
     }
 
     /// Download file if it doesn't exist (thread-safe, streaming, with GZ support)
-    /// Uses lock to prevent concurrent downloads of the same file
-    /// CRITICAL: Lock is acquired BEFORE download to prevent multiple threads from downloading the same file
+    /// 
+    /// Race Condition Prevention:
+    /// 1. Fast path check (without lock) - optimization for common case
+    /// 2. Acquire lock BEFORE download - prevents multiple threads from downloading simultaneously
+    /// 3. Double-check after lock - another thread might have downloaded while we were waiting
+    /// 4. Download while holding lock - ensures only one thread downloads at a time
+    /// 
+    /// This pattern prevents:
+    /// - Multiple threads downloading the same large file (waste of bandwidth)
+    /// - Race conditions where two threads both think file doesn't exist
+    /// - Corrupted files from concurrent writes
     async fn download_if_missing(path: &str, url: &str) -> Result<()> {
-        // Fast path: check if file exists before acquiring lock (optimization)
+        // Step 1: Fast path check (without lock) - optimization for common case
+        // If file already exists, we can return immediately without acquiring lock
         if Path::new(path).exists() {
             info!("Dictionary already exists: {}", path);
             return Ok(());
         }
 
-        // Acquire lock BEFORE download to prevent race condition
+        // Step 2: Acquire lock BEFORE download to prevent race condition
+        // CRITICAL: Lock must be acquired BEFORE download, not after
+        // If we download first and then acquire lock, multiple threads could download simultaneously
         // Multiple threads trying to download the same file would waste bandwidth
         // Lock ensures only one thread downloads, others wait
         let _guard = DOWNLOAD_LOCK.lock().await;
 
-        // Double-check after acquiring lock (another thread might have downloaded it)
+        // Step 3: Double-check after acquiring lock (double-checked locking pattern)
+        // Another thread might have downloaded the file while we were waiting for the lock
+        // This prevents redundant downloads
         if Path::new(path).exists() {
             info!("Dictionary already exists (checked after lock): {}", path);
             return Ok(());
         }
 
-        // Now download (while holding lock to prevent concurrent downloads)
+        // Step 4: Download while holding lock (prevents concurrent downloads)
         // This prevents multiple threads from downloading the same 140MB file simultaneously
+        // Lock is held for the entire download + write operation
         info!("Downloading dictionary: {} from {}", path, url);
         let response = reqwest::get(url).await
             .context(format!("Failed to download from {}", url))?;

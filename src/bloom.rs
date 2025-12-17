@@ -104,4 +104,85 @@ mod tests {
         assert!(bloom.contains(&item1));
         assert!(!bloom.contains(&item2));
     }
+
+    /// Test bloom filter overflow handling
+    /// Verifies that bloom filter clears at 95% capacity and handles overflow gracefully
+    #[test]
+    fn test_bloom_filter_overflow() {
+        let bloom = BloomFilterManager::new(100, 0.01); // Small capacity for testing
+
+        // Fill bloom filter to near capacity (95%)
+        // 95% of 100 = 95 items
+        for i in 0..95 {
+            bloom.add(&format!("item_{}", i)).unwrap();
+        }
+
+        // Verify we're at 95% capacity
+        assert!(bloom.is_near_capacity(), "Bloom filter should be near capacity at 95%");
+        assert_eq!(bloom.len(), 95);
+
+        // Adding one more item should trigger auto-clear (happens inside add())
+        // After clear, count should reset to 1 (the new item)
+        bloom.add(&"item_95").unwrap();
+        
+        // After auto-clear, the count should be 1 (just the new item)
+        // Note: The auto-clear happens inside add(), so the new item is added after clearing
+        assert_eq!(bloom.len(), 1, "Bloom filter should have been cleared and new item added");
+        assert!(bloom.contains(&"item_95"), "New item should be in bloom filter after clear");
+
+        // Verify old items are gone (bloom filter was cleared)
+        assert!(!bloom.contains(&"item_0"), "Old items should be gone after clear");
+    }
+
+    /// Test bloom filter capacity limits
+    /// Note: Bloom filter auto-clears at 95% capacity, so we can't test exact capacity overflow
+    /// Instead, we test that the auto-clear mechanism works correctly
+    #[test]
+    fn test_bloom_filter_capacity_limit() {
+        let bloom = BloomFilterManager::new(10, 0.01); // Very small capacity
+
+        // Fill to 95% capacity (9 items out of 10)
+        // At 95%, auto-clear should trigger on next add
+        for i in 0..9 {
+            bloom.add(&format!("item_{}", i)).unwrap();
+        }
+
+        // Verify we're at 95% capacity
+        assert!(bloom.is_near_capacity(), "Bloom filter should be near capacity at 95%");
+        assert_eq!(bloom.len(), 9);
+
+        // Adding one more item should trigger auto-clear (happens inside add())
+        // After clear, count should reset to 1 (the new item)
+        bloom.add(&"item_9").unwrap();
+        
+        // After auto-clear, the count should be 1 (just the new item)
+        // The auto-clear happens inside add() when is_near_capacity() is true
+        assert_eq!(bloom.len(), 1, "Bloom filter should have been auto-cleared and new item added");
+        assert!(bloom.contains(&"item_9"), "New item should be in bloom filter after auto-clear");
+        
+        // Verify old items are gone (bloom filter was cleared)
+        assert!(!bloom.contains(&"item_0"), "Old items should be gone after auto-clear");
+    }
+
+    /// Test bloom filter clear functionality
+    #[test]
+    fn test_bloom_filter_clear() {
+        let bloom = BloomFilterManager::new(1000, 0.01);
+
+        // Add some items
+        bloom.add(&"item1").unwrap();
+        bloom.add(&"item2").unwrap();
+        assert_eq!(bloom.len(), 2);
+
+        // Clear bloom filter
+        bloom.clear();
+        assert_eq!(bloom.len(), 0);
+        assert!(!bloom.contains(&"item1"));
+        assert!(!bloom.contains(&"item2"));
+
+        // Can add items after clear
+        bloom.add(&"item3").unwrap();
+        assert_eq!(bloom.len(), 1);
+        assert!(bloom.contains(&"item3"));
+    }
 }

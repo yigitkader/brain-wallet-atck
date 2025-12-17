@@ -209,7 +209,10 @@ async fn main() -> Result<()> {
             continue;
         }
         
-        // Check if bloom filter is near capacity and clear if needed
+        // Proactive bloom filter management: clear at 95% capacity to prevent overflow
+        // This prevents the bloom filter from reaching 100% and causing add() failures
+        // NOTE: Clearing will cause previously checked patterns to be re-checked,
+        // but this is acceptable to prevent overflow and crash
         if bloom_filter.is_near_capacity() {
             warn!("Bloom filter 95% full ({} / {}), clearing to prevent overflow...", 
                   bloom_filter.len(), bloom_filter.capacity());
@@ -242,28 +245,26 @@ async fn main() -> Result<()> {
 
         // ONLY add to bloom filter after successful balance check
         // This ensures we don't mark patterns as "checked" when API fails
-        // Add to bloom filter (with graceful degradation on failure)
+        // 
+        // NOTE: BloomFilterManager.add() already performs proactive clearing at 95% capacity internally.
+        // If add() still fails, it means the pattern is too large or there's an internal issue.
+        // In this case, we use graceful degradation: continue processing without duplicate check.
+        // Clearing and retrying here would be redundant and would cause previously checked
+        // patterns to be lost, leading to duplicate API calls.
         if let Err(e) = bloom_filter.add(&pattern) {
-            warn!("Bloom filter capacity exceeded: {}. Clearing...", e);
-            bloom_filter.clear();
+            // Graceful degradation: continue without duplicate check for this pattern
+            // This is acceptable - we'll process the pattern anyway, just without duplicate detection
+            let failure_count = bloom_failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            warn!("Bloom filter add failed: {}. Continuing without duplicate check for this pattern. (Total failures: {})", e, failure_count);
             
-            // Try to add again after clearing (graceful degradation)
-            if let Err(e2) = bloom_filter.add(&pattern) {
-                // Pattern might be too large or bloom filter has internal issues
-                // Graceful degradation: continue without duplicate check for this pattern
-                // This is acceptable - we'll process the pattern anyway, just without duplicate detection
-                let failure_count = bloom_failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                warn!("Pattern too large for bloom filter after clear: {}. Continuing without duplicate check for this pattern. (Total failures: {})", e2, failure_count);
-                
-                // Warn if bloom filter is consistently failing (might indicate a systemic issue)
-                if failure_count % 100 == 0 {
-                    warn!("Bloom filter has failed {} times. Consider increasing bloom_capacity in config or investigating pattern sizes.", failure_count);
-                }
-                // Don't panic - continue processing the pattern
-            } else {
-                // Success after clear - reset failure counter
-                bloom_failure_count.store(0, std::sync::atomic::Ordering::Relaxed);
+            // Warn if bloom filter is consistently failing (might indicate a systemic issue)
+            if failure_count % 100 == 0 {
+                warn!("Bloom filter has failed {} times. Consider increasing bloom_capacity in config or investigating pattern sizes.", failure_count);
             }
+            // Don't panic - continue processing the pattern
+        } else {
+            // Success - reset failure counter on successful add
+            bloom_failure_count.store(0, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Update statistics
