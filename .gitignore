@@ -3,3 +3,5 @@
 *.log
 *.iml
 .DS_Store
+/dictionaries
+/output
