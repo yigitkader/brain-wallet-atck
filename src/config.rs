@@ -92,10 +92,12 @@ fn default_max_password_combinations() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationConfig {
-    /// Webhook URL for alerts
+    /// Webhook URL for alerts (can be set via WEBHOOK_URL env var for security)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
 
-    /// Email for alerts
+    /// Email for alerts (can be set via EMAIL env var for security)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
     /// Alert on find
@@ -103,17 +105,37 @@ pub struct NotificationConfig {
 }
 
 impl Config {
-    /// Load configuration from TOML file
+    /// Load configuration from TOML file and environment variables
     pub fn load(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)
             .context(format!("Failed to read config file: {}", path))?;
 
-        let config: Config = toml::from_str(&content)
+        let mut config: Config = toml::from_str(&content)
             .context("Failed to parse TOML config")?;
+
+        // Override sensitive values from environment variables (more secure)
+        config.load_from_env();
 
         config.validate()?;
 
         Ok(config)
+    }
+
+    /// Load sensitive config from environment variables (overrides file config)
+    fn load_from_env(&mut self) {
+        // Webhook URL from environment variable (prevents credential leak in git)
+        if let Ok(webhook) = std::env::var("WEBHOOK_URL") {
+            if !webhook.is_empty() {
+                self.notifications.webhook_url = Some(webhook);
+            }
+        }
+        
+        // Email from environment variable (prevents credential leak in git)
+        if let Ok(email) = std::env::var("EMAIL") {
+            if !email.is_empty() {
+                self.notifications.email = Some(email);
+            }
+        }
     }
 
     /// Validate configuration
@@ -162,7 +184,7 @@ btc_paths = [
 ]
 
 [rate_limiting]
-min_delay_ms = 1000
+min_delay_ms = 2000
 batch_cooldown_ms = 5000
 max_retries = 3
 
@@ -219,7 +241,7 @@ impl Default for Config {
                 ],
             },
             rate_limiting: RateLimitConfig {
-                min_delay_ms: 1000,
+                min_delay_ms: 2000,
                 batch_cooldown_ms: 5000,
                 max_retries: 3,
             },

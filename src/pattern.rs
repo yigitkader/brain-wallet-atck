@@ -201,9 +201,10 @@ impl PatternGenerator {
 
         // 6. Password + number combinations (MEDIUM)
         // Use config limit to prevent memory explosion
+        // Reduced to 0..10 instead of 0..1000 to prevent excessive pattern generation
         let max_password_combinations = config.optimization.max_password_combinations;
         for password in dictionaries.passwords.iter().take(max_password_combinations) {
-            for number in 0..1000 {
+            for number in 0..10 {
                 patterns.push(AttackPattern::PasswordNumber {
                     password: password.clone(),
                     number,

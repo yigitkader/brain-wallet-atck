@@ -45,6 +45,44 @@ impl BalanceChecker {
     }
 
     /// Check balances for all wallet addresses
+    /// Check if error is a rate limit error (429)
+    fn is_rate_limit_error(e: &anyhow::Error) -> bool {
+        let error_str = format!("{}", e);
+        error_str.contains("429") || error_str.contains("Rate limited") || error_str.contains("rate limit")
+    }
+
+    /// Retry balance check with exponential backoff on rate limit errors
+    async fn check_with_retry<F, Fut>(&self, check_fn: F, max_retries: u32) -> Result<f64>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<f64>>,
+    {
+        let mut last_error = None;
+        
+        for attempt in 0..max_retries {
+            match check_fn().await {
+                Ok(balance) => return Ok(balance),
+                Err(e) => {
+                    last_error = Some(e);
+                    // If it's a rate limit error, wait and retry
+                    if Self::is_rate_limit_error(last_error.as_ref().unwrap()) {
+                        let backoff_secs = 2_u64.pow(attempt.min(5)); // Max 32 seconds
+                        warn!("Rate limited, waiting {} seconds before retry (attempt {}/{})...", 
+                              backoff_secs, attempt + 1, max_retries);
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        continue;
+                    } else {
+                        // Non-rate-limit error, return immediately
+                        return Err(last_error.unwrap());
+                    }
+                }
+            }
+        }
+        
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Max retries exceeded")))
+    }
+
     pub async fn check(&self, wallets: &WalletAddresses) -> Result<BalanceResults> {
         let mut results = BalanceResults {
             btc: HashMap::new(),
@@ -52,23 +90,31 @@ impl BalanceChecker {
             sol: None,
         };
 
+        let max_retries = self.config.rate_limiting.max_retries;
+
         // Check Bitcoin addresses
         for address in &wallets.btc {
             self.rate_limit().await;
 
-            // Try primary API first, fallback to blockchain.com if it fails
-            let balance = match self.check_btc_balance(address).await {
+            // Try primary API first with retry logic, fallback to blockchain.com if it fails
+            let balance = match self.check_with_retry(
+                || self.check_btc_balance(address),
+                max_retries
+            ).await {
                 Ok(b) => b,
                 Err(e) => {
-                    warn!("Primary BTC API failed for {}: {}, trying fallback...", address, e);
-                    // Fallback to blockchain.com API
-                    match self.check_btc_balance_blockchain_com(address).await {
+                    warn!("Primary BTC API failed for {} after retries: {}, trying fallback...", address, e);
+                    // Fallback to blockchain.com API with retry logic
+                    match self.check_with_retry(
+                        || self.check_btc_balance_blockchain_com(address),
+                        max_retries
+                    ).await {
                         Ok(b) => b,
                         Err(e2) => {
-                            warn!("Both BTC APIs failed for {}: primary={}, fallback={}", address, e, e2);
-                            // Don't mark as checked if both APIs failed
+                            warn!("Both BTC APIs failed for {} after retries: primary={}, fallback={}", address, e, e2);
+                            // Don't mark as checked if both APIs failed after retries
                             // Return error to prevent silent failure
-                            return Err(anyhow::anyhow!("Both BTC APIs failed: primary={}, fallback={}", e, e2));
+                            return Err(anyhow::anyhow!("Both BTC APIs failed after retries: primary={}, fallback={}", e, e2));
                         }
                     }
                 }

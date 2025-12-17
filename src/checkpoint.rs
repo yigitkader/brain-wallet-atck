@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
+use fs2::FileExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -32,7 +33,7 @@ impl CheckpointManager {
         })
     }
 
-    /// Save checkpoint to file (atomic write to prevent corruption)
+    /// Save checkpoint to file (atomic write with file locking to prevent corruption)
     pub fn save(&self, index: usize, checked: u64, found: u64) -> Result<()> {
         let checkpoint = Checkpoint {
             last_index: index,
@@ -45,6 +46,11 @@ impl CheckpointManager {
         let temp_path = format!("{}.tmp", self.path);
         let file = File::create(&temp_path)
             .context("Failed to create temp checkpoint file")?;
+        
+        // Acquire exclusive lock to prevent concurrent writes from multiple processes
+        file.lock_exclusive()
+            .context("Failed to acquire exclusive lock on checkpoint file")?;
+        
         let mut writer = BufWriter::new(file);
 
         serde_json::to_writer_pretty(&mut writer, &checkpoint)
@@ -54,7 +60,7 @@ impl CheckpointManager {
         writer.flush()
             .context("Failed to flush checkpoint buffer")?;
         
-        // Drop writer to close file handle
+        // Drop writer to close file handle and release lock
         drop(writer);
 
         // Atomic rename (POSIX guarantees this is atomic)
@@ -64,7 +70,7 @@ impl CheckpointManager {
         Ok(())
     }
 
-    /// Load checkpoint from file
+    /// Load checkpoint from file (with shared lock for concurrent reads)
     pub fn load(&self) -> Result<Option<usize>> {
         if !Path::new(&self.path).exists() {
             return Ok(None);
@@ -72,6 +78,11 @@ impl CheckpointManager {
 
         let file = File::open(&self.path)
             .context("Failed to open checkpoint file")?;
+        
+        // Acquire shared lock to allow concurrent reads but prevent writes
+        file.lock_shared()
+            .context("Failed to acquire shared lock on checkpoint file")?;
+        
         let reader = BufReader::new(file);
 
         let checkpoint: Checkpoint = serde_json::from_reader(reader)

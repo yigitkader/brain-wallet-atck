@@ -151,15 +151,25 @@ impl WalletGenerator {
     }
 
     /// Generate Solana address
+    /// Solana uses Ed25519, NOT secp256k1, so we must use ed25519-dalek
     fn generate_sol_address(&self, seed: &[u8; 64]) -> Result<String> {
-        // Solana uses Ed25519, derive using BIP44: m/44'/501'/0'/0'
-        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, seed)?;
-        let path = DerivationPath::from_str("m/44'/501'/0'/0'")?;
-        let derived = xpriv.derive_priv(&self.secp, &path)?;
-
-        // Convert to base58 (simplified)
-        let pubkey = derived.to_priv().public_key(&self.secp);
-        let pubkey_bytes = pubkey.inner.serialize_uncompressed();
+        use ed25519_dalek::{SigningKey, VerifyingKey};
+        
+        // Solana uses Ed25519, which requires 32-byte seed
+        // Use first 32 bytes of the 64-byte seed
+        let ed25519_seed: [u8; 32] = seed[0..32].try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid seed length for Ed25519"))?;
+        
+        // Create Ed25519 signing key from seed
+        let signing_key = SigningKey::from_bytes(&ed25519_seed);
+        
+        // Get verifying key (public key)
+        let verifying_key: VerifyingKey = signing_key.verifying_key();
+        
+        // Solana address is the Ed25519 public key encoded in base58
+        let pubkey_bytes = verifying_key.to_bytes();
+        assert_eq!(pubkey_bytes.len(), 32, "Ed25519 public key must be 32 bytes");
+        
         Ok(bs58::encode(&pubkey_bytes).into_string())
     }
 
