@@ -201,14 +201,17 @@ impl BalanceChecker {
 
     /// Rate limiting implementation
     async fn rate_limit(&self) {
+        // Always delay every request to respect API rate limits
+        sleep(Duration::from_millis(self.config.rate_limiting.min_delay_ms)).await;
+
         let count = self.request_count.fetch_add(
             1,
             std::sync::atomic::Ordering::SeqCst
         );
 
-        // Basic rate limiting
-        if count % 10 == 0 {
-            sleep(Duration::from_millis(self.config.rate_limiting.min_delay_ms)).await;
+        // Additional cooldown every 50 requests
+        if count % 50 == 0 {
+            sleep(Duration::from_millis(self.config.rate_limiting.batch_cooldown_ms)).await;
         }
 
         debug!("API request #{}", count);

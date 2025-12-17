@@ -193,9 +193,10 @@ impl PatternGenerator {
         }
 
         // 6. Password + number combinations (MEDIUM)
-        // Only top 1000 passwords with numbers 0-9999
-        for password in dictionaries.passwords.iter().take(1000) {
-            for number in 0..10000 {
+        // Limit to prevent memory explosion: top 100 passwords with numbers 0-999
+        // This generates 100 * 1000 = 100K patterns instead of 10M
+        for password in dictionaries.passwords.iter().take(100) {
+            for number in 0..1000 {
                 patterns.push(AttackPattern::PasswordNumber {
                     password: password.clone(),
                     number,

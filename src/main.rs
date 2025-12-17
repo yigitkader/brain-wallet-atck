@@ -176,8 +176,15 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Check balances
-        let results = balance_checker.check(&wallets).await?;
+        // Check balances with error handling
+        let results = match balance_checker.check(&wallets).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Balance check failed for pattern {}: {}", pattern, e);
+                // Continue processing, don't crash
+                continue;
+            }
+        };
 
         // Update statistics
         stats.increment_checked();

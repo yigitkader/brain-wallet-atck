@@ -199,6 +199,7 @@ dependencies = [
  "hmac",
  "indicatif",
  "mockall",
+ "once_cell",
  "parking_lot",
  "pbkdf2",
  "reqwest",

@@ -3,22 +3,25 @@
 // ============================================================================
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
-use parking_lot::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Thread-safe statistics tracker
 pub struct Statistics {
     checked: AtomicU64,
     found: AtomicU64,
-    start_time: RwLock<Instant>,
+    start_time: AtomicU64, // Unix timestamp in seconds (thread-safe)
 }
 
 impl Statistics {
     pub fn new() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         Self {
             checked: AtomicU64::new(0),
             found: AtomicU64::new(0),
-            start_time: RwLock::new(Instant::now()),
+            start_time: AtomicU64::new(now),
         }
     }
 
@@ -39,7 +42,12 @@ impl Statistics {
     }
 
     pub fn elapsed(&self) -> f64 {
-        self.start_time.read().elapsed().as_secs_f64()
+        let start = self.start_time.load(Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        (now - start) as f64
     }
 
     pub fn get_rate(&self) -> f64 {
@@ -56,6 +64,10 @@ impl Statistics {
     pub fn reset(&self) {
         self.checked.store(0, Ordering::Relaxed);
         self.found.store(0, Ordering::Relaxed);
-        *self.start_time.write() = Instant::now();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.start_time.store(now, Ordering::Relaxed);
     }
 }

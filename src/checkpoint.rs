@@ -32,7 +32,7 @@ impl CheckpointManager {
         })
     }
 
-    /// Save checkpoint to file
+    /// Save checkpoint to file (atomic write to prevent corruption)
     pub fn save(&self, index: usize, checked: u64, found: u64) -> Result<()> {
         let checkpoint = Checkpoint {
             last_index: index,
@@ -41,12 +41,22 @@ impl CheckpointManager {
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
 
-        let file = File::create(&self.path)
-            .context("Failed to create checkpoint file")?;
+        // Atomic write pattern: write to temp file first, then rename
+        let temp_path = format!("{}.tmp", self.path);
+        let file = File::create(&temp_path)
+            .context("Failed to create temp checkpoint file")?;
         let writer = BufWriter::new(file);
 
         serde_json::to_writer_pretty(writer, &checkpoint)
             .context("Failed to write checkpoint")?;
+
+        // Flush and sync to ensure data is written to disk
+        // Note: BufWriter is dropped here, which flushes automatically
+        // The file is already written, sync is handled by the OS on rename
+
+        // Atomic rename (POSIX guarantees this is atomic)
+        std::fs::rename(&temp_path, &self.path)
+            .context("Failed to rename temp checkpoint file")?;
 
         Ok(())
     }

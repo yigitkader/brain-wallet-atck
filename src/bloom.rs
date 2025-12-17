@@ -5,9 +5,11 @@
 use bloom::{BloomFilter as InternalBloom, ASMS};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct BloomFilterManager {
     filter: parking_lot::RwLock<InternalBloom>,
+    item_count: AtomicU64, // Manual counter for accurate statistics
 }
 
 impl BloomFilterManager {
@@ -20,6 +22,7 @@ impl BloomFilterManager {
 
         Self {
             filter: parking_lot::RwLock::new(filter),
+            item_count: AtomicU64::new(0),
         }
     }
 
@@ -33,6 +36,7 @@ impl BloomFilterManager {
     pub fn add<T: Hash>(&self, item: &T) {
         let hash = Self::hash_item(item);
         self.filter.write().insert(&hash);
+        self.item_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Hash any item to u64
@@ -42,19 +46,15 @@ impl BloomFilterManager {
         hasher.finish()
     }
 
-    /// Get estimated number of items
-    /// Note: Bloom filters don't track exact count, this is an approximation
+    /// Get number of items added to bloom filter
     pub fn len(&self) -> usize {
-        // We can't get exact count from bloom filter, but we can estimate
-        // based on the number of hash operations. For now, return 0 as
-        // the bloom crate doesn't provide a count method.
-        // This is a limitation of the bloom filter implementation.
-        0
+        self.item_count.load(Ordering::Relaxed) as usize
     }
 
     /// Clear bloom filter (useful when starting fresh or resetting)
     pub fn clear(&self) {
         self.filter.write().clear();
+        self.item_count.store(0, Ordering::Relaxed);
     }
 }
 

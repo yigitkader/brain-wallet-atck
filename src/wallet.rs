@@ -63,16 +63,21 @@ impl WalletGenerator {
                 Ok(seed)
             }
 
-            // Try BIP39 mnemonic first
+            // Single word - use PBKDF2 directly (not valid BIP39)
+            AttackPattern::SingleWord { word } => {
+                self.pbkdf2_seed(word)
+            }
+            
+            // Try BIP39 mnemonic first for other patterns
             _ => {
                 let mnemonic_str = pattern.to_mnemonic(&crate::dictionary::Dictionaries::default())?;
 
-                // Try to parse as valid BIP39
+                // Try to parse as valid BIP39 (12/15/18/21/24 words)
                 if let Ok(mnemonic) = Mnemonic::parse_in_normalized(Language::English, &mnemonic_str) {
                     let seed = mnemonic.to_seed("");
                     Ok(seed)
                 } else {
-                    // Fallback: Use PBKDF2 on raw text
+                    // Fallback: Use PBKDF2 on raw text (for non-BIP39 patterns)
                     self.pbkdf2_seed(&mnemonic_str)
                 }
             }
@@ -118,8 +123,12 @@ impl WalletGenerator {
     }
 
     /// Generate Ethereum address
+    /// Note: Network::Bitcoin is only used for master key derivation.
+    /// The actual Ethereum address is derived using BIP44 path m/44'/60'/0'/0/0
+    /// and uses keccak256 hash, which is correct for Ethereum.
     fn generate_eth_address(&self, seed: &[u8; 64]) -> Result<String> {
         // Derive Ethereum key using BIP44 path: m/44'/60'/0'/0/0
+        // Network::Bitcoin is only for master key format, not the final address
         let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, seed)?;
         let path = DerivationPath::from_str("m/44'/60'/0'/0/0")?;
         let derived = xpriv.derive_priv(&self.secp, &path)?;
