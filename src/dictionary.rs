@@ -352,13 +352,10 @@ impl DictionaryLoader {
                 }
                 Err(e) => {
                     // If UTF-8 error, skip this line (dictionary files may have binary data)
+                    // Don't log each error individually to avoid log spam in large files (e.g., rockyou.txt)
                     if e.to_string().contains("UTF-8") {
                         utf8_errors += 1;
-                        // Only log first few errors to avoid spam
-                        if utf8_errors <= 3 {
-                            warn!("Skipping invalid UTF-8 line in {} (will skip silently after this)", path);
-                        }
-                        continue; // Skip this line
+                        continue; // Skip this line silently
                     } else {
                         return Err(e.into());
                     }
@@ -366,7 +363,8 @@ impl DictionaryLoader {
             }
         }
 
-        if utf8_errors > 3 {
+        // Only log summary if there were UTF-8 errors (avoid log spam)
+        if utf8_errors > 0 {
             info!("Skipped {} invalid UTF-8 lines in {} (normal for binary dictionary files)", utf8_errors, path);
         }
 
@@ -393,13 +391,10 @@ impl DictionaryLoader {
                 }
                 Err(e) => {
                     // If UTF-8 error, skip this line (dictionary files may have binary data)
+                    // Don't log each error individually to avoid log spam in large files (e.g., rockyou.txt)
                     if e.to_string().contains("UTF-8") {
                         utf8_errors += 1;
-                        // Only log first few errors to avoid spam
-                        if utf8_errors <= 3 {
-                            warn!("Skipping invalid UTF-8 line in {} (will skip silently after this)", path);
-                        }
-                        continue; // Skip this line
+                        continue; // Skip this line silently
                     } else {
                         return Err(e.into());
                     }
@@ -407,7 +402,8 @@ impl DictionaryLoader {
             }
         }
 
-        if utf8_errors > 3 {
+        // Only log summary if there were UTF-8 errors (avoid log spam)
+        if utf8_errors > 0 {
             info!("Skipped {} invalid UTF-8 lines in {} (normal for binary dictionary files)", utf8_errors, path);
         }
 

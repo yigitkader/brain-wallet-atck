@@ -75,10 +75,16 @@ impl CheckpointManager {
         drop(writer);
 
         // Atomic rename (POSIX guarantees this is atomic)
-        std::fs::rename(&temp_path, &self.path)
-            .context("Failed to rename temp checkpoint file")?;
-
-        Ok(())
+        // CRITICAL: Cleanup temp file on failure to prevent accumulation
+        match std::fs::rename(&temp_path, &self.path) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Cleanup temp file on failure to prevent accumulation
+                // This prevents temp files from accumulating if disk is full or permission errors occur
+                let _ = std::fs::remove_file(&temp_path);
+                Err(e).context("Failed to rename temp checkpoint file")
+            }
+        }
     }
 
     /// Load checkpoint from file (with shared lock for concurrent reads)

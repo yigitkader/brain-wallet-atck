@@ -245,6 +245,10 @@ impl PatternGenerator {
         let keyboard_patterns_iter = Self::generate_keyboard_patterns();
         
         // Chain all iterators in priority order (highest first)
+        // NOTE: Patterns with the same priority (e.g., single_word_iter, mutation_iter, keyboard_patterns_iter all Priority 9)
+        // are chained in a fixed order. Within the same priority, the order is deterministic but not sorted.
+        // This is acceptable for performance - full priority-based sorting would require collecting all patterns
+        // into memory first, which defeats the purpose of lazy iteration for memory efficiency.
         known_weak_iter
             .chain(single_word_iter)
             .chain(mutation_iter) // Mutations are also Priority 9
