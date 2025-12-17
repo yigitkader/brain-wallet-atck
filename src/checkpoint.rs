@@ -72,6 +72,15 @@ impl CheckpointManager {
 
     /// Load checkpoint from file (with shared lock for concurrent reads)
     pub fn load(&self) -> Result<Option<usize>> {
+        if let Some(checkpoint) = self.load_full()? {
+            Ok(Some(checkpoint.last_index))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load full checkpoint data (including statistics)
+    pub fn load_full(&self) -> Result<Option<Checkpoint>> {
         if !Path::new(&self.path).exists() {
             return Ok(None);
         }
@@ -88,7 +97,7 @@ impl CheckpointManager {
         let checkpoint: Checkpoint = serde_json::from_reader(reader)
             .context("Failed to parse checkpoint")?;
 
-        Ok(Some(checkpoint.last_index))
+        Ok(Some(checkpoint))
     }
 
     /// Delete checkpoint file (useful for starting fresh)

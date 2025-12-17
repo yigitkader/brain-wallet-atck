@@ -60,6 +60,17 @@ impl BloomFilterManager {
         self.item_count.load(Ordering::Relaxed) as usize
     }
 
+    /// Get capacity of bloom filter
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Check if bloom filter is near capacity (95% threshold)
+    pub fn is_near_capacity(&self) -> bool {
+        let current_count = self.item_count.load(Ordering::Relaxed) as usize;
+        current_count >= (self.capacity * 95 / 100)
+    }
+
     /// Clear bloom filter (useful when starting fresh or resetting)
     pub fn clear(&self) {
         self.filter.write().clear();

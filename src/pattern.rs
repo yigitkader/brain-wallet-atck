@@ -201,10 +201,11 @@ impl PatternGenerator {
 
         // 6. Password + number combinations (MEDIUM)
         // Use config limit to prevent memory explosion
-        // Reduced to 0..10 instead of 0..1000 to prevent excessive pattern generation
+        // Use important numbers instead of 0..10 to catch common patterns without memory explosion
         let max_password_combinations = config.optimization.max_password_combinations;
+        let important_numbers = [0, 1, 12, 123, 1234, 2023, 2024, 2025, 69, 420, 666, 777, 999, 2020, 2021, 2022];
         for password in dictionaries.passwords.iter().take(max_password_combinations) {
-            for number in 0..10 {
+            for &number in &important_numbers {
                 patterns.push(AttackPattern::PasswordNumber {
                     password: password.clone(),
                     number,
@@ -223,8 +224,8 @@ impl PatternGenerator {
         }
 
         // Add pattern mutations (leetspeak, case variations, etc.)
-        // Use same limit as password combinations to be consistent
-        let mutation_limit = config.optimization.max_password_combinations.min(100);
+        // Increase limit to generate more mutations (top 10K passwords instead of 100)
+        let mutation_limit = config.optimization.max_password_combinations.min(10_000);
         patterns.extend(Self::generate_mutations(&dictionaries.passwords.iter().take(mutation_limit).cloned().collect::<Vec<_>>()));
 
         Ok(patterns)

@@ -96,10 +96,17 @@ async fn main() -> Result<()> {
         info!("Checkpoint cleared, starting fresh");
     }
     
-    let start_index = if args.resume {
-        checkpoint_manager.load()?.unwrap_or(0)
+    // Load checkpoint data (index and statistics)
+    let (start_index, checkpoint_stats) = if args.resume {
+        if let Some(checkpoint) = checkpoint_manager.load_full()? {
+            info!("Resuming from checkpoint: index={}, checked={}, found={}", 
+                  checkpoint.last_index, checkpoint.checked, checkpoint.found);
+            (checkpoint.last_index, Some((checkpoint.checked, checkpoint.found)))
+        } else {
+            (0, None)
+        }
     } else {
-        0
+        (0, None)
     };
 
     info!("Starting from index: {}", start_index);
@@ -107,8 +114,11 @@ async fn main() -> Result<()> {
     // Initialize statistics
     let stats = Arc::new(Statistics::new());
     
-    // Reset statistics if starting fresh (not resuming)
-    if !args.resume || start_index == 0 {
+    // Restore statistics from checkpoint if resuming, otherwise reset
+    if let Some((checked, found)) = checkpoint_stats {
+        stats.restore(checked, found);
+        info!("Restored statistics: checked={}, found={}", checked, found);
+    } else {
         stats.reset();
     }
 
@@ -186,10 +196,22 @@ async fn main() -> Result<()> {
         if bloom_filter.contains(&pattern) {
             continue;
         }
+        
+        // Check if bloom filter is near capacity and clear if needed
+        if bloom_filter.is_near_capacity() {
+            warn!("Bloom filter 95% full ({} / {}), clearing to prevent overflow...", 
+                  bloom_filter.len(), bloom_filter.capacity());
+            bloom_filter.clear();
+        }
+        
         // Add to bloom filter (with capacity check)
         if let Err(e) = bloom_filter.add(&pattern) {
-            warn!("Bloom filter capacity exceeded: {}. Continuing without bloom filter...", e);
-            // Continue without bloom filter (will check duplicates less efficiently)
+            warn!("Bloom filter capacity exceeded: {}. Clearing and continuing...", e);
+            bloom_filter.clear();
+            // Try to add again after clearing
+            if let Err(e2) = bloom_filter.add(&pattern) {
+                warn!("Failed to add to bloom filter after clear: {}. Continuing without duplicate check...", e2);
+            }
         }
 
         // Generate wallet from pattern

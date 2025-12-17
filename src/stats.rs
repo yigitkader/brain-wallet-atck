@@ -60,7 +60,7 @@ impl Statistics {
         }
     }
 
-    /// Reset statistics (useful when resuming from checkpoint)
+    /// Reset statistics (useful when starting fresh)
     pub fn reset(&self) {
         self.checked.store(0, Ordering::Relaxed);
         self.found.store(0, Ordering::Relaxed);
@@ -69,5 +69,12 @@ impl Statistics {
             .unwrap()
             .as_secs();
         self.start_time.store(now, Ordering::Relaxed);
+    }
+
+    /// Restore statistics from checkpoint (useful when resuming)
+    pub fn restore(&self, checked: u64, found: u64) {
+        self.checked.store(checked, Ordering::Relaxed);
+        self.found.store(found, Ordering::Relaxed);
+        // Don't reset start_time - keep original start time for accurate rate calculation
     }
 }

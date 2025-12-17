@@ -111,10 +111,9 @@ impl BalanceChecker {
                     ).await {
                         Ok(b) => b,
                         Err(e2) => {
-                            warn!("Both BTC APIs failed for {} after retries: primary={}, fallback={}", address, e, e2);
-                            // Don't mark as checked if both APIs failed after retries
-                            // Return error to prevent silent failure
-                            return Err(anyhow::anyhow!("Both BTC APIs failed after retries: primary={}, fallback={}", e, e2));
+                            warn!("Both BTC APIs failed for {} after retries: primary={}, fallback={}. Assuming 0 balance.", address, e, e2);
+                            // Assume 0 balance instead of crashing - don't stop entire process
+                            0.0
                         }
                     }
                 }

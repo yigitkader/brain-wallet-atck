@@ -98,21 +98,13 @@ impl DictionaryLoader {
 
     /// Download file if it doesn't exist (thread-safe, streaming, with GZ support)
     async fn download_if_missing(path: &str, url: &str) -> Result<()> {
-        // Check again after acquiring lock (double-check pattern)
+        // Check if file exists before acquiring lock
         if Path::new(path).exists() {
             info!("Dictionary already exists: {}", path);
             return Ok(());
         }
 
-        // Acquire lock to prevent concurrent downloads
-        let _guard = DOWNLOAD_LOCK.lock().await;
-
-        // Double-check after acquiring lock
-        if Path::new(path).exists() {
-            info!("Dictionary already exists (checked after lock): {}", path);
-            return Ok(());
-        }
-
+        // Download outside of lock to prevent blocking other threads
         info!("Downloading dictionary: {} from {}", path, url);
         let response = reqwest::get(url).await
             .context(format!("Failed to download from {}", url))?;
@@ -136,6 +128,35 @@ impl DictionaryLoader {
                 .map(|v| v.contains("gzip"))
                 .unwrap_or(false);
 
+        // Download bytes outside of lock
+        let bytes = if is_gzipped {
+            // For GZ files, download and decompress
+            let raw_bytes = response.bytes().await
+                .context("Failed to read response body")?;
+            let mut decoder = GzDecoder::new(raw_bytes.as_ref());
+            let mut decompressed = Vec::new();
+            std::io::copy(&mut decoder, &mut decompressed)
+                .context("Failed to decompress GZ file")?;
+            decompressed
+        } else {
+            // For regular files, download directly
+            if total_size > 10_000_000 {
+                warn!("Large file detected ({} bytes), downloading in chunks...", total_size);
+            }
+            response.bytes().await
+                .context("Failed to read response body")?
+                .to_vec()
+        };
+
+        // Acquire lock only for file write (prevent concurrent writes)
+        let _guard = DOWNLOAD_LOCK.lock().await;
+
+        // Double-check after acquiring lock (another process might have downloaded it)
+        if Path::new(path).exists() {
+            info!("Dictionary already exists (checked after download): {}", path);
+            return Ok(());
+        }
+
         // Create parent directory if needed
         if let Some(parent) = Path::new(path).parent() {
             create_dir_all(parent)?;
@@ -146,26 +167,9 @@ impl DictionaryLoader {
         let mut file = File::create(&temp_path)
             .context(format!("Failed to create temp file: {}", temp_path))?;
 
-        if is_gzipped {
-            // Stream and decompress GZ file
-            let bytes = response.bytes().await
-                .context("Failed to read response body")?;
-            let mut decoder = GzDecoder::new(bytes.as_ref());
-            std::io::copy(&mut decoder, &mut file)
-                .context("Failed to decompress GZ file")?;
-        } else {
-            // Stream download (prevent OOM) - copy directly to file
-            // For small files (< 10MB), use bytes(). For larger, this would need streaming
-            // reqwest 0.11 doesn't have easy streaming, so we use bytes() but with size check
-            if total_size > 10_000_000 {
-                warn!("Large file detected ({} bytes), downloading in chunks...", total_size);
-            }
-            
-            let bytes = response.bytes().await
-                .context("Failed to read response body")?;
-            file.write_all(&bytes)
-                .context("Failed to write file")?;
-        }
+        // Write downloaded bytes to file
+        file.write_all(&bytes)
+            .context("Failed to write file")?;
 
         file.sync_all()?; // Ensure data is written to disk
         

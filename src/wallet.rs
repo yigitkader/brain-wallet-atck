@@ -63,9 +63,19 @@ impl WalletGenerator {
                 Ok(seed)
             }
 
-            // Single word - use PBKDF2 directly (not valid BIP39)
+            // Single word - try to create valid BIP39 mnemonic first, fallback to PBKDF2
             AttackPattern::SingleWord { word } => {
-                self.pbkdf2_seed(word)
+                // Try to create a valid BIP39 mnemonic by repeating the word 12 times
+                let words: Vec<&str> = std::iter::repeat(word.as_str()).take(12).collect();
+                let repeated = words.join(" ");
+                
+                // Try to parse as valid BIP39 mnemonic
+                if let Ok(mnemonic) = Mnemonic::parse_in_normalized(Language::English, &repeated) {
+                    Ok(mnemonic.to_seed(""))
+                } else {
+                    // Fallback: Use PBKDF2 on raw word (for non-BIP39 words)
+                    self.pbkdf2_seed(word)
+                }
             }
             
             // Try BIP39 mnemonic first for other patterns
@@ -113,8 +123,20 @@ impl WalletGenerator {
                 .context("Failed to derive key")?;
 
             let pubkey = derived.to_priv().public_key(&self.secp);
-            let address = bitcoin::Address::p2wpkh(&pubkey, Network::Bitcoin)
-                .context("Failed to create address")?;
+            
+            // Use correct address type based on derivation path
+            let address = if path_str.starts_with("m/44'") {
+                // Legacy (P2PKH) - m/44'/0'/0'/0/0
+                bitcoin::Address::p2pkh(&pubkey, Network::Bitcoin)
+            } else if path_str.starts_with("m/49'") {
+                // SegWit (P2SH-P2WPKH) - m/49'/0'/0'/0/0
+                bitcoin::Address::p2shwpkh(&pubkey, Network::Bitcoin)
+                    .context("Failed to create SegWit address")?
+            } else {
+                // Native SegWit (P2WPKH) - m/84'/0'/0'/0/0 (default)
+                bitcoin::Address::p2wpkh(&pubkey, Network::Bitcoin)
+                    .context("Failed to create Native SegWit address")?
+            };
 
             addresses.push(address.to_string());
         }
@@ -141,9 +163,9 @@ impl WalletGenerator {
         // Ethereum address = last 20 bytes of keccak256(public_key)
         // serialize_uncompressed() returns 65 bytes: 0x04 (1 byte) + X (32 bytes) + Y (32 bytes)
         let pub_bytes_full = public_key.serialize_uncompressed();
-        assert_eq!(pub_bytes_full.len(), 65, "Public key must be 65 bytes (0x04 + 64 bytes)");
-        let pub_bytes = &pub_bytes_full[1..65]; // Remove 0x04 prefix, get exactly 64 bytes
-        assert_eq!(pub_bytes.len(), 64, "Public key must be exactly 64 bytes for Ethereum");
+        assert_eq!(pub_bytes_full.len(), 65, "Uncompressed pubkey must be 65 bytes (0x04 + X + Y)");
+        let pub_bytes = &pub_bytes_full[1..]; // Remove 0x04 prefix, get exactly 64 bytes
+        assert_eq!(pub_bytes.len(), 64, "Public key coords must be 64 bytes");
         let hash = Self::keccak256(pub_bytes);
         let address = hex::encode(&hash[12..]);
 
@@ -152,12 +174,21 @@ impl WalletGenerator {
 
     /// Generate Solana address
     /// Solana uses Ed25519, NOT secp256k1, so we must use ed25519-dalek
+    /// Uses BIP44 derivation path: m/44'/501'/0'/0'
     fn generate_sol_address(&self, seed: &[u8; 64]) -> Result<String> {
         use ed25519_dalek::{SigningKey, VerifyingKey};
         
-        // Solana uses Ed25519, which requires 32-byte seed
-        // Use first 32 bytes of the 64-byte seed
-        let ed25519_seed: [u8; 32] = seed[0..32].try_into()
+        // Solana uses BIP44 path: m/44'/501'/0'/0'
+        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, seed)
+            .context("Failed to create master key for Solana")?;
+        let path = DerivationPath::from_str("m/44'/501'/0'/0'")
+            .context("Invalid Solana derivation path")?;
+        let derived = xpriv.derive_priv(&self.secp, &path)
+            .context("Failed to derive Solana key")?;
+        
+        // Use first 32 bytes of the derived private key as Ed25519 seed
+        let private_key_bytes = derived.to_priv().to_bytes();
+        let ed25519_seed: [u8; 32] = private_key_bytes[0..32].try_into()
             .map_err(|_| anyhow::anyhow!("Invalid seed length for Ed25519"))?;
         
         // Create Ed25519 signing key from seed
