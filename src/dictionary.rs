@@ -98,6 +98,7 @@ impl DictionaryLoader {
 
     /// Download file if it doesn't exist (thread-safe, streaming, with GZ support)
     /// Uses lock to prevent concurrent downloads of the same file
+    /// CRITICAL: Lock is acquired BEFORE download to prevent multiple threads from downloading the same file
     async fn download_if_missing(path: &str, url: &str) -> Result<()> {
         // Fast path: check if file exists before acquiring lock (optimization)
         if Path::new(path).exists() {
@@ -105,9 +106,19 @@ impl DictionaryLoader {
             return Ok(());
         }
 
-        // Download OUTSIDE lock to avoid blocking other threads during network I/O
-        // Large files (e.g., rockyou.txt ~140MB) can take 30+ seconds to download
-        // Holding the lock during download would block all other dictionary operations
+        // Acquire lock BEFORE download to prevent race condition
+        // Multiple threads trying to download the same file would waste bandwidth
+        // Lock ensures only one thread downloads, others wait
+        let _guard = DOWNLOAD_LOCK.lock().await;
+
+        // Double-check after acquiring lock (another thread might have downloaded it)
+        if Path::new(path).exists() {
+            info!("Dictionary already exists (checked after lock): {}", path);
+            return Ok(());
+        }
+
+        // Now download (while holding lock to prevent concurrent downloads)
+        // This prevents multiple threads from downloading the same 140MB file simultaneously
         info!("Downloading dictionary: {} from {}", path, url);
         let response = reqwest::get(url).await
             .context(format!("Failed to download from {}", url))?;
@@ -131,7 +142,7 @@ impl DictionaryLoader {
                 .map(|v| v.contains("gzip"))
                 .unwrap_or(false);
 
-        // Download bytes OUTSIDE lock (allows concurrent downloads of different files)
+        // Download bytes (while holding lock)
         let bytes = if is_gzipped {
             // For GZ files, download and decompress
             let raw_bytes = response.bytes().await
@@ -150,16 +161,6 @@ impl DictionaryLoader {
                 .context("Failed to read response body")?
                 .to_vec()
         };
-
-        // Acquire lock ONLY for file write to prevent race condition on file system
-        // Multiple threads can download concurrently, but only one writes to the same file
-        let _guard = DOWNLOAD_LOCK.lock().await;
-
-        // Double-check after acquiring lock (another thread might have downloaded it while we were downloading)
-        if Path::new(path).exists() {
-            info!("Dictionary already exists (checked after lock): {}", path);
-            return Ok(());
-        }
 
         // Create parent directory if needed
         if let Some(parent) = Path::new(path).parent() {

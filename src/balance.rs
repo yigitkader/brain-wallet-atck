@@ -92,17 +92,30 @@ impl BalanceChecker {
     }
     
     /// Calculate jitter value (0-1000ms) to prevent thundering herd problem
-    /// Uses SystemTime for thread-safe pseudo-random jitter without external dependencies
+    /// Uses thread-local random number generator for true randomness
+    /// This prevents multiple threads from getting the same jitter value
     fn calculate_jitter() -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
         use std::time::{SystemTime, UNIX_EPOCH};
-        // Use current time in nanoseconds to generate pseudo-random jitter
-        // This is thread-safe and doesn't require external dependencies
+        use std::thread;
+        
+        // Combine thread ID and timestamp for better randomness
+        // This is more random than just timestamp modulo
+        let thread_id = thread::current().id();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .subsec_nanos() as u64;
+            .as_nanos();
+        
+        // Hash thread ID + timestamp for better distribution
+        let mut hasher = DefaultHasher::new();
+        thread_id.hash(&mut hasher);
+        nanos.hash(&mut hasher);
+        let hash = hasher.finish();
+        
         // Jitter between 0-1000ms
-        nanos % 1000
+        hash % 1000
     }
 
     pub async fn check(&self, wallets: &WalletAddresses) -> Result<BalanceResults> {

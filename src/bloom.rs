@@ -35,8 +35,19 @@ impl BloomFilterManager {
         self.filter.read().contains(&hash)
     }
 
-    /// Add pattern to bloom filter (with capacity check)
+    /// Add pattern to bloom filter (with proactive capacity management)
+    /// Automatically clears at 95% capacity to prevent overflow
     pub fn add<T: Hash>(&self, item: &T) -> Result<()> {
+        // Proactive clear at 95% capacity to prevent overflow
+        // This prevents the bloom filter from reaching 100% and crashing
+        if self.is_near_capacity() {
+            use tracing::warn;
+            warn!("Bloom filter 95% full ({} / {}), auto-clearing to prevent overflow...", 
+                  self.item_count.load(Ordering::Relaxed), self.capacity);
+            self.clear();
+        }
+        
+        // Double-check capacity after potential clear
         let current_count = self.item_count.load(Ordering::Relaxed);
         if current_count >= self.capacity as u64 {
             anyhow::bail!("Bloom filter capacity exceeded: {} (max: {})", current_count, self.capacity);

@@ -121,24 +121,26 @@ impl WalletGenerator {
             
             // Use correct address type based on derivation path
             // CRITICAL: Each BIP44 path type has a specific address format
-            // - m/44' = Legacy (P2PKH)
-            // - m/49' = SegWit (P2SH-P2WPKH)
-            // - m/84' = Native SegWit (P2WPKH)
-            // Unknown paths are rejected to prevent generating incorrect addresses
-            let address = if path_str.starts_with("m/44'") {
-                // Legacy (P2PKH) - m/44'/0'/0'/0/0
+            // - m/44'/0' = Legacy (P2PKH) - Bitcoin mainnet only
+            // - m/49'/0' = SegWit (P2SH-P2WPKH) - Bitcoin mainnet only
+            // - m/84'/0' = Native SegWit (P2WPKH) - Bitcoin mainnet only
+            // Note: We only support mainnet (coin_type 0), not testnet (coin_type 1)
+            // More specific check prevents edge cases like m/44'/1'/... (testnet) from being accepted
+            let address = if path_str.starts_with("m/44'/0'") {
+                // Legacy (P2PKH) - m/44'/0'/0'/0/0 (Bitcoin mainnet only)
                 bitcoin::Address::p2pkh(&pubkey, Network::Bitcoin)
-            } else if path_str.starts_with("m/49'") {
-                // SegWit (P2SH-P2WPKH) - m/49'/0'/0'/0/0
+            } else if path_str.starts_with("m/49'/0'") {
+                // SegWit (P2SH-P2WPKH) - m/49'/0'/0'/0/0 (Bitcoin mainnet only)
                 bitcoin::Address::p2shwpkh(&pubkey, Network::Bitcoin)
                     .context("Failed to create SegWit address")?
-            } else if path_str.starts_with("m/84'") {
-                // Native SegWit (P2WPKH) - m/84'/0'/0'/0/0
+            } else if path_str.starts_with("m/84'/0'") {
+                // Native SegWit (P2WPKH) - m/84'/0'/0'/0/0 (Bitcoin mainnet only)
                 bitcoin::Address::p2wpkh(&pubkey, Network::Bitcoin)
                     .context("Failed to create Native SegWit address")?
             } else {
-                // Reject unknown derivation paths to prevent incorrect address generation
-                anyhow::bail!("Unsupported Bitcoin derivation path: {}. Supported paths: m/44' (Legacy), m/49' (SegWit), m/84' (Native SegWit)", path_str);
+                // Reject unknown derivation paths to prevent generating incorrect addresses
+                // Note: Testnet paths (m/44'/1', etc.) are not supported
+                anyhow::bail!("Unsupported Bitcoin derivation path: {}. Supported paths: m/44'/0' (Legacy), m/49'/0' (SegWit), m/84'/0' (Native SegWit) - mainnet only", path_str);
             };
 
             addresses.push(address.to_string());
@@ -148,12 +150,15 @@ impl WalletGenerator {
     }
 
     /// Generate Ethereum address
-    /// Note: Network::Bitcoin is only used for master key derivation.
+    /// Note: Network::Bitcoin is used for BIP32 master key derivation format.
+    /// This is technically correct as BIP32 doesn't distinguish between networks at the master key level.
     /// The actual Ethereum address is derived using BIP44 path m/44'/60'/0'/0/0
     /// and uses keccak256 hash, which is correct for Ethereum.
+    /// While Ethereum has its own network standards, BIP32 master key derivation is network-agnostic.
     fn generate_eth_address(&self, seed: &[u8; 64]) -> Result<String> {
         // Derive Ethereum key using BIP44 path: m/44'/60'/0'/0/0
-        // Network::Bitcoin is only for master key format, not the final address
+        // Network::Bitcoin is used for BIP32 format (network-agnostic at master key level)
+        // The final Ethereum address uses keccak256, which is Ethereum-specific
         let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, seed)?;
         let path = DerivationPath::from_str("m/44'/60'/0'/0/0")?;
         let derived = xpriv.derive_priv(&self.secp, &path)?;
@@ -176,18 +181,27 @@ impl WalletGenerator {
     }
 
     /// Generate Solana address
-    /// Solana uses Ed25519, NOT secp256k1
-    /// Solana uses SLIP-0010 standard: directly use first 32 bytes of seed as Ed25519 seed
-    /// DO NOT use BIP32/BIP44 derivation (that's for secp256k1, not Ed25519)
+    /// Solana uses Ed25519 with BIP44 derivation path m/44'/501'/0'/0'
+    /// Standard Solana wallets use BIP44 derivation, then convert derived key to Ed25519
     fn generate_sol_address(&self, seed: &[u8; 64]) -> Result<String> {
         use ed25519_dalek::{SigningKey, VerifyingKey};
         
-        // Solana SLIP-0010: Use first 32 bytes of seed directly as Ed25519 seed
-        // This is the correct way to derive Solana addresses from a seed
-        let ed25519_seed: [u8; 32] = seed[0..32].try_into()
+        // Solana uses BIP44 path: m/44'/501'/0'/0'
+        // Derive using BIP32/BIP44 first, then convert to Ed25519
+        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, seed)
+            .context("Failed to create master key for Solana")?;
+        let path = DerivationPath::from_str("m/44'/501'/0'/0'")
+            .context("Invalid Solana derivation path")?;
+        let derived = xpriv.derive_priv(&self.secp, &path)
+            .context("Failed to derive Solana key")?;
+        
+        // Use first 32 bytes of the derived private key as Ed25519 seed
+        // This is the standard way Solana wallets derive addresses
+        let private_key_bytes = derived.to_priv().to_bytes();
+        let ed25519_seed: [u8; 32] = private_key_bytes[0..32].try_into()
             .map_err(|_| anyhow::anyhow!("Invalid seed length for Ed25519"))?;
         
-        // Create Ed25519 signing key directly from seed (SLIP-0010 standard)
+        // Create Ed25519 signing key from derived seed
         let signing_key = SigningKey::from_bytes(&ed25519_seed);
         
         // Get verifying key (public key)

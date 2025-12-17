@@ -213,7 +213,32 @@ async fn main() -> Result<()> {
             bloom_filter.clear();
             bloom_failure_count.store(0, std::sync::atomic::Ordering::Relaxed); // Reset counter after successful clear
         }
-        
+
+        // Generate wallet from pattern
+        let wallets = match wallet_generator.generate(&pattern) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("Failed to generate wallet: {}", e);
+                continue;
+            }
+        };
+
+        // Check balances with error handling
+        // CRITICAL: Only add to bloom filter AFTER successful balance check
+        // If API fails, we don't add to bloom filter so pattern can be retried later
+        let results = match balance_checker.check(&wallets).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Balance check failed for pattern {}: {}. NOT adding to bloom filter - will retry later", pattern, e);
+                // Continue processing, don't crash
+                // CRITICAL: Don't add to bloom filter on API failure - allows retry later
+                // Don't increment checked count if balance check completely failed
+                continue;
+            }
+        };
+
+        // ONLY add to bloom filter after successful balance check
+        // This ensures we don't mark patterns as "checked" when API fails
         // Add to bloom filter (with graceful degradation on failure)
         if let Err(e) = bloom_filter.add(&pattern) {
             warn!("Bloom filter capacity exceeded: {}. Clearing...", e);
@@ -237,26 +262,6 @@ async fn main() -> Result<()> {
                 bloom_failure_count.store(0, std::sync::atomic::Ordering::Relaxed);
             }
         }
-
-        // Generate wallet from pattern
-        let wallets = match wallet_generator.generate(&pattern) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!("Failed to generate wallet: {}", e);
-                continue;
-            }
-        };
-
-        // Check balances with error handling
-        let results = match balance_checker.check(&wallets).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Balance check failed for pattern {}: {}", pattern, e);
-                // Continue processing, don't crash
-                // Don't increment checked count if balance check completely failed
-                continue;
-            }
-        };
 
         // Update statistics
         stats.increment_checked();
