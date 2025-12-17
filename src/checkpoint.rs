@@ -82,6 +82,10 @@ impl CheckpointManager {
     }
 
     /// Load checkpoint from file (with shared lock for concurrent reads)
+    /// Returns only the last_index for simple checkpoint resume
+    /// For full checkpoint data including statistics, use load_full()
+    /// Used in tests to verify checkpoint functionality
+    #[allow(dead_code)] // Used in tests
     pub fn load(&self) -> Result<Option<usize>> {
         if let Some(checkpoint) = self.load_full()? {
             Ok(Some(checkpoint.last_index))
@@ -117,5 +121,80 @@ impl CheckpointManager {
             fs::remove_file(&self.path)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_checkpoint_save_and_load() {
+        // Test checkpoint save and load functionality
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join("test_checkpoint.json");
+        let manager = CheckpointManager::new(checkpoint_path.to_str().unwrap()).unwrap();
+
+        // Save checkpoint
+        manager.save(100, 50, 2, Some(1234567890)).unwrap();
+
+        // Load using load() method (simple version)
+        let loaded_index = manager.load().unwrap();
+        assert_eq!(loaded_index, Some(100));
+
+        // Load using load_full() method (full version)
+        let full_checkpoint = manager.load_full().unwrap().unwrap();
+        assert_eq!(full_checkpoint.last_index, 100);
+        assert_eq!(full_checkpoint.checked, 50);
+        assert_eq!(full_checkpoint.found, 2);
+        assert_eq!(full_checkpoint.start_time, Some(1234567890));
+    }
+
+    #[test]
+    fn test_checkpoint_start_time_preservation() {
+        // Test that start_time is preserved across multiple saves
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join("test_checkpoint2.json");
+        let manager = CheckpointManager::new(checkpoint_path.to_str().unwrap()).unwrap();
+
+        let original_start_time = 1234567890;
+
+        // First save with start_time
+        manager.save(100, 50, 2, Some(original_start_time)).unwrap();
+
+        // Second save without start_time (should preserve original)
+        manager.save(200, 100, 4, None).unwrap();
+
+        let checkpoint = manager.load_full().unwrap().unwrap();
+        assert_eq!(checkpoint.start_time, Some(original_start_time),
+                   "Start time should be preserved across saves");
+    }
+
+    #[test]
+    fn test_checkpoint_clear() {
+        // Test checkpoint clearing
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join("test_checkpoint3.json");
+        let manager = CheckpointManager::new(checkpoint_path.to_str().unwrap()).unwrap();
+
+        // Save checkpoint
+        manager.save(100, 50, 2, None).unwrap();
+        assert!(manager.load().unwrap().is_some());
+
+        // Clear checkpoint
+        manager.clear().unwrap();
+        assert!(manager.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_checkpoint_nonexistent() {
+        // Test loading non-existent checkpoint
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join("nonexistent.json");
+        let manager = CheckpointManager::new(checkpoint_path.to_str().unwrap()).unwrap();
+
+        assert!(manager.load().unwrap().is_none());
+        assert!(manager.load_full().unwrap().is_none());
     }
 }

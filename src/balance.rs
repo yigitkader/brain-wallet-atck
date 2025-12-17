@@ -344,22 +344,73 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore] // Requires network access - run with: cargo test -- --ignored
     async fn test_btc_balance_check() {
+        // Integration test: Requires network access to mainnet APIs
+        // This test verifies that BTC balance checking works correctly on mainnet
         let config = Config::default();
         let checker = BalanceChecker::new(&config).await.unwrap();
 
-        // Test with known address with balance (change to valid test address)
+        // Test with Bitcoin genesis block address (known to have balance)
         let balance = checker.check_btc_balance("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").await;
         assert!(balance.is_ok());
+        // Genesis block address should have balance > 0
+        assert!(balance.unwrap() > 0.0);
     }
 
     #[tokio::test]
+    #[ignore] // Requires network access - run with: cargo test -- --ignored
     async fn test_eth_balance_check() {
+        // Integration test: Requires network access to mainnet APIs
+        // This test verifies that ETH balance checking works correctly on mainnet
         let config = Config::default();
         let checker = BalanceChecker::new(&config).await.unwrap();
 
-        // Test with Ethereum Foundation address
+        // Test with Ethereum Foundation address (known to have balance)
         let balance = checker.check_eth_balance("0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae").await;
         assert!(balance.is_ok());
+        // Ethereum Foundation address should have balance > 0
+        assert!(balance.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_balance_results_is_empty() {
+        // Unit test: Test BalanceResults::is_empty() logic
+        // Note: is_empty() checks if there are any entries, not if balances are zero
+        let mut results = BalanceResults {
+            btc: HashMap::new(),
+            eth: None,
+            sol: None,
+        };
+        assert!(results.is_empty());
+
+        // Adding 0.0 balance still counts as an entry (address was checked)
+        results.btc.insert("test".to_string(), 0.0);
+        assert!(!results.is_empty()); // Has entry, even if balance is 0
+
+        results.btc.clear();
+        results.eth = Some(0.0);
+        assert!(!results.is_empty()); // Has ETH entry, even if balance is 0
+
+        results.eth = None;
+        results.sol = Some(0.0);
+        assert!(!results.is_empty()); // Has SOL entry, even if balance is 0
+
+        // Truly empty
+        results.sol = None;
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_rate_limit_error_detection() {
+        // Unit test: Test rate limit error detection logic
+        let error1 = anyhow::anyhow!("Rate limited (429)");
+        assert!(BalanceChecker::is_rate_limit_error(&error1));
+
+        let error2 = anyhow::anyhow!("HTTP 429 Too Many Requests");
+        assert!(BalanceChecker::is_rate_limit_error(&error2));
+
+        let error3 = anyhow::anyhow!("Connection timeout");
+        assert!(!BalanceChecker::is_rate_limit_error(&error3));
     }
 }

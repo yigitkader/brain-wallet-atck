@@ -149,13 +149,10 @@ async fn main() -> Result<()> {
     let dictionaries = DictionaryLoader::load_all(&config)?;
     info!("Loaded {} dictionary entries", dictionaries.total_entries());
 
-    // Generate attack patterns
-    info!("Generating attack patterns...");
-    let mut patterns = PatternGenerator::generate(&dictionaries, &config)?;
-    info!("Generated {} attack patterns", patterns.len());
-
-    // Sort by priority (highest first)
-    patterns.sort_by_key(|p| std::cmp::Reverse(p.priority()));
+    // Generate attack patterns using lazy iterator (memory-efficient)
+    info!("Generating attack patterns (lazy iterator mode)...");
+    let patterns_iter = PatternGenerator::generate_iter(&dictionaries, &config);
+    info!("Pattern iterator ready (patterns generated on-demand to save memory)");
 
     // Initialize components
     let wallet_generator = WalletGenerator::new(&config)?;
@@ -163,7 +160,7 @@ async fn main() -> Result<()> {
 
     // Main attack loop
     info!("Starting attack loop...");
-    info!("Target: {} patterns", max_patterns.min(patterns.len()));
+    info!("Target: {} patterns", max_patterns);
 
     let progress_bar = indicatif::ProgressBar::new(max_patterns as u64);
     progress_bar.set_style(
@@ -186,7 +183,13 @@ async fn main() -> Result<()> {
         shutdown_tx_clone.send(()).await.ok();
     });
 
-    for (i, pattern) in patterns.iter().enumerate().skip(start_index) {
+    // Use iterator with enumerate to track index
+    // Skip patterns up to start_index (for checkpoint resume)
+    // CRITICAL: enumerate() must be AFTER skip() to get correct absolute index
+    for (relative_idx, pattern) in patterns_iter.skip(start_index).enumerate() {
+        // Calculate absolute index (for checkpoint and progress tracking)
+        let i = start_index + relative_idx;
+        
         // Check for shutdown signal (non-blocking)
         if shutdown_rx.try_recv().is_ok() {
             info!("Shutdown signal received, saving checkpoint...");
@@ -329,8 +332,10 @@ async fn main() -> Result<()> {
     info!("Statistics saved to output/stats.json");
 
     // Save final checkpoint
+    // Note: patterns_iter doesn't have a known length (lazy evaluation)
+    // We use max_patterns as the final index since we iterate up to that limit
     checkpoint_manager.save(
-        max_patterns.min(patterns.len()),
+        max_patterns,
         stats.checked(),
         stats.found(),
         Some(stats.start_time())
