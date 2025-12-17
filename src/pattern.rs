@@ -224,51 +224,85 @@ impl PatternGenerator {
         }
 
         // Add pattern mutations (leetspeak, case variations, etc.)
-        // Increase limit to generate more mutations (top 10K passwords instead of 100)
-        let mutation_limit = config.optimization.max_password_combinations.min(10_000);
-        patterns.extend(Self::generate_mutations(&dictionaries.passwords.iter().take(mutation_limit).cloned().collect::<Vec<_>>()));
+        // Use configurable limits to prevent memory explosion
+        // Memory calculation: max_mutation_words × max_mutations_per_word = total mutation patterns
+        // Example: 1000 words × 10 mutations = 10K patterns (~1-2 MB)
+        let mutation_word_limit = config.optimization.max_mutation_words;
+        let mutation_words: Vec<String> = dictionaries.passwords.iter()
+            .take(mutation_word_limit)
+            .cloned()
+            .collect();
+        patterns.extend(Self::generate_mutations(&mutation_words, config.optimization.max_mutations_per_word));
 
         Ok(patterns)
     }
 
     /// Generate pattern mutations (leetspeak, case variations)
-    fn generate_mutations(base_words: &[String]) -> Vec<AttackPattern> {
+    /// Limited by max_mutations_per_word to prevent memory explosion
+    fn generate_mutations(base_words: &[String], max_mutations_per_word: usize) -> Vec<AttackPattern> {
         let mut mutations = Vec::new();
+        
+        // Pre-allocate with estimated capacity to reduce reallocations
+        // Estimate: max_mutations_per_word mutations per word + keyboard patterns
+        let estimated_capacity = (base_words.len() * max_mutations_per_word) + 4;
+        mutations.reserve(estimated_capacity);
 
         for word in base_words {
-            // Leetspeak mutations
-            let mut leet = word.clone();
-            leet = leet.replace('a', "4");
-            leet = leet.replace('e', "3");
-            leet = leet.replace('i', "1");
-            leet = leet.replace('o', "0");
-            leet = leet.replace('s', "5");
-            mutations.push(AttackPattern::SingleWord { word: leet });
+            let mut word_mutations = 0;
+            
+            // Priority 1: Leetspeak (most common mutation)
+            if word_mutations < max_mutations_per_word {
+                let mut leet = word.clone();
+                leet = leet.replace('a', "4");
+                leet = leet.replace('e', "3");
+                leet = leet.replace('i', "1");
+                leet = leet.replace('o', "0");
+                leet = leet.replace('s', "5");
+                mutations.push(AttackPattern::SingleWord { word: leet });
+                word_mutations += 1;
+            }
 
-            // Case variations
-            mutations.push(AttackPattern::SingleWord {
-                word: word.to_uppercase()
-            });
-            mutations.push(AttackPattern::SingleWord {
-                word: word.to_lowercase()
-            });
+            // Priority 2: Case variations (if limit allows)
+            if word_mutations < max_mutations_per_word {
+                mutations.push(AttackPattern::SingleWord {
+                    word: word.to_uppercase()
+                });
+                word_mutations += 1;
+            }
+            
+            if word_mutations < max_mutations_per_word {
+                mutations.push(AttackPattern::SingleWord {
+                    word: word.to_lowercase()
+                });
+                word_mutations += 1;
+            }
 
-            // Common suffixes
-            for suffix in &["123", "!", "2024", "2023", "@", "#"] {
+            // Priority 3: Common suffixes (limited by remaining mutations)
+            let suffixes = ["123", "!", "2024", "2023", "@", "#"];
+            for suffix in &suffixes {
+                if word_mutations >= max_mutations_per_word {
+                    break;
+                }
                 mutations.push(AttackPattern::SingleWord {
                     word: format!("{}{}", word, suffix),
                 });
+                word_mutations += 1;
             }
 
-            // Common prefixes
-            for prefix in &["my", "the", "crypto", "btc"] {
+            // Priority 4: Common prefixes (limited by remaining mutations)
+            let prefixes = ["my", "the", "crypto", "btc"];
+            for prefix in &prefixes {
+                if word_mutations >= max_mutations_per_word {
+                    break;
+                }
                 mutations.push(AttackPattern::SingleWord {
                     word: format!("{}{}", prefix, word),
                 });
+                word_mutations += 1;
             }
         }
 
-        // Keyboard patterns
+        // Keyboard patterns (always included, not counted in per-word limit)
         for pattern in &["qwerty123", "asdfgh", "12345678", "qwertyuiop"] {
             mutations.push(AttackPattern::SingleWord {
                 word: pattern.to_string(),

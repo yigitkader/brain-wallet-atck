@@ -63,19 +63,14 @@ impl WalletGenerator {
                 Ok(seed)
             }
 
-            // Single word - try to create valid BIP39 mnemonic first, fallback to PBKDF2
+            // Single word - use PBKDF2 directly (NOT BIP39)
+            // CRITICAL: BIP39 requires checksum validation. Repeating the same word 12 times
+            // will almost never create a valid BIP39 mnemonic (checksum will fail).
+            // For BIP39 wallet attacks, use Bip39Repeat pattern instead.
             AttackPattern::SingleWord { word } => {
-                // Try to create a valid BIP39 mnemonic by repeating the word 12 times
-                let words: Vec<&str> = std::iter::repeat(word.as_str()).take(12).collect();
-                let repeated = words.join(" ");
-                
-                // Try to parse as valid BIP39 mnemonic
-                if let Ok(mnemonic) = Mnemonic::parse_in_normalized(Language::English, &repeated) {
-                    Ok(mnemonic.to_seed(""))
-                } else {
-                    // Fallback: Use PBKDF2 on raw word (for non-BIP39 words)
-                    self.pbkdf2_seed(word)
-                }
+                // Use PBKDF2 directly - this is the correct way for single word passphrases
+                // BIP39 checksum validation would fail for repeated words anyway
+                self.pbkdf2_seed(word)
             }
             
             // Try BIP39 mnemonic first for other patterns
@@ -173,25 +168,18 @@ impl WalletGenerator {
     }
 
     /// Generate Solana address
-    /// Solana uses Ed25519, NOT secp256k1, so we must use ed25519-dalek
-    /// Uses BIP44 derivation path: m/44'/501'/0'/0'
+    /// Solana uses Ed25519, NOT secp256k1
+    /// Solana uses SLIP-0010 standard: directly use first 32 bytes of seed as Ed25519 seed
+    /// DO NOT use BIP32/BIP44 derivation (that's for secp256k1, not Ed25519)
     fn generate_sol_address(&self, seed: &[u8; 64]) -> Result<String> {
         use ed25519_dalek::{SigningKey, VerifyingKey};
         
-        // Solana uses BIP44 path: m/44'/501'/0'/0'
-        let xpriv = ExtendedPrivKey::new_master(Network::Bitcoin, seed)
-            .context("Failed to create master key for Solana")?;
-        let path = DerivationPath::from_str("m/44'/501'/0'/0'")
-            .context("Invalid Solana derivation path")?;
-        let derived = xpriv.derive_priv(&self.secp, &path)
-            .context("Failed to derive Solana key")?;
-        
-        // Use first 32 bytes of the derived private key as Ed25519 seed
-        let private_key_bytes = derived.to_priv().to_bytes();
-        let ed25519_seed: [u8; 32] = private_key_bytes[0..32].try_into()
+        // Solana SLIP-0010: Use first 32 bytes of seed directly as Ed25519 seed
+        // This is the correct way to derive Solana addresses from a seed
+        let ed25519_seed: [u8; 32] = seed[0..32].try_into()
             .map_err(|_| anyhow::anyhow!("Invalid seed length for Ed25519"))?;
         
-        // Create Ed25519 signing key from seed
+        // Create Ed25519 signing key directly from seed (SLIP-0010 standard)
         let signing_key = SigningKey::from_bytes(&ed25519_seed);
         
         // Get verifying key (public key)

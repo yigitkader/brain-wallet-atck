@@ -80,6 +80,17 @@ pub struct OptimizationConfig {
     /// Max password combinations for PasswordNumber pattern (prevents memory explosion)
     #[serde(default = "default_max_password_combinations")]
     pub max_password_combinations: usize,
+
+    /// Max mutations per word (prevents memory explosion in pattern mutations)
+    /// Each word can generate ~20 mutations (leetspeak, case, suffixes, prefixes)
+    /// Lower this value to reduce memory usage
+    #[serde(default = "default_max_mutations_per_word")]
+    pub max_mutations_per_word: usize,
+
+    /// Max words to generate mutations for (prevents memory explosion)
+    /// Mutations are expensive: 1000 words × 20 mutations = 20K patterns
+    #[serde(default = "default_max_mutation_words")]
+    pub max_mutation_words: usize,
 }
 
 fn default_batch_size() -> usize {
@@ -88,6 +99,14 @@ fn default_batch_size() -> usize {
 
 fn default_max_password_combinations() -> usize {
     100
+}
+
+fn default_max_mutations_per_word() -> usize {
+    10 // Limit mutations per word to prevent memory explosion
+}
+
+fn default_max_mutation_words() -> usize {
+    1000 // Limit number of words to mutate (1000 words × 10 mutations = 10K patterns)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +213,8 @@ bloom_capacity = 100_000_000
 use_gpu = false
 batch_size = 1000
 max_password_combinations = 100
+max_mutations_per_word = 10
+max_mutation_words = 1000
 
 [notifications]
 webhook_url = ""
@@ -251,6 +272,8 @@ impl Default for Config {
                 use_gpu: false,
                 batch_size: 1000,
                 max_password_combinations: 100,
+                max_mutations_per_word: 10,
+                max_mutation_words: 1000,
             },
             notifications: NotificationConfig {
                 webhook_url: None,

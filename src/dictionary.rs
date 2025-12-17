@@ -97,14 +97,27 @@ impl DictionaryLoader {
     }
 
     /// Download file if it doesn't exist (thread-safe, streaming, with GZ support)
+    /// Uses lock to prevent concurrent downloads of the same file
     async fn download_if_missing(path: &str, url: &str) -> Result<()> {
-        // Check if file exists before acquiring lock
+        // Fast path: check if file exists before acquiring lock (optimization)
         if Path::new(path).exists() {
             info!("Dictionary already exists: {}", path);
             return Ok(());
         }
 
-        // Download outside of lock to prevent blocking other threads
+        // Acquire lock BEFORE download to prevent concurrent downloads
+        // This ensures only one thread downloads the file, others wait
+        let _guard = DOWNLOAD_LOCK.lock().await;
+
+        // Double-check after acquiring lock (another thread might have downloaded it)
+        if Path::new(path).exists() {
+            info!("Dictionary already exists (checked after lock): {}", path);
+            return Ok(());
+        }
+
+        // Download inside lock to prevent race condition
+        // Note: This blocks other threads, but ensures only one download happens
+        // For large files, this is acceptable since concurrent downloads would waste bandwidth
         info!("Downloading dictionary: {} from {}", path, url);
         let response = reqwest::get(url).await
             .context(format!("Failed to download from {}", url))?;
@@ -128,7 +141,7 @@ impl DictionaryLoader {
                 .map(|v| v.contains("gzip"))
                 .unwrap_or(false);
 
-        // Download bytes outside of lock
+        // Download bytes inside lock (prevents concurrent downloads)
         let bytes = if is_gzipped {
             // For GZ files, download and decompress
             let raw_bytes = response.bytes().await
@@ -147,15 +160,6 @@ impl DictionaryLoader {
                 .context("Failed to read response body")?
                 .to_vec()
         };
-
-        // Acquire lock only for file write (prevent concurrent writes)
-        let _guard = DOWNLOAD_LOCK.lock().await;
-
-        // Double-check after acquiring lock (another process might have downloaded it)
-        if Path::new(path).exists() {
-            info!("Dictionary already exists (checked after download): {}", path);
-            return Ok(());
-        }
 
         // Create parent directory if needed
         if let Some(parent) = Path::new(path).parent() {

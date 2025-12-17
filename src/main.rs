@@ -197,6 +197,8 @@ async fn main() -> Result<()> {
         }
 
         // Check bloom filter (skip duplicates)
+        // Note: If bloom filter is disabled due to overflow, contains() may not work correctly
+        // but we continue processing to avoid stopping the entire attack
         if bloom_filter.contains(&pattern) {
             continue;
         }
@@ -208,13 +210,18 @@ async fn main() -> Result<()> {
             bloom_filter.clear();
         }
         
-        // Add to bloom filter (with capacity check)
+        // Add to bloom filter (with graceful degradation on failure)
         if let Err(e) = bloom_filter.add(&pattern) {
-            warn!("Bloom filter capacity exceeded: {}. Clearing and continuing...", e);
+            warn!("Bloom filter capacity exceeded: {}. Clearing...", e);
             bloom_filter.clear();
-            // Try to add again after clearing
+            
+            // Try to add again after clearing (graceful degradation)
             if let Err(e2) = bloom_filter.add(&pattern) {
-                warn!("Failed to add to bloom filter after clear: {}. Continuing without duplicate check...", e2);
+                // Pattern might be too large or bloom filter has internal issues
+                // Graceful degradation: continue without duplicate check for this pattern
+                // This is acceptable - we'll process the pattern anyway, just without duplicate detection
+                warn!("Pattern too large for bloom filter after clear: {}. Continuing without duplicate check for this pattern.", e2);
+                // Don't panic - continue processing the pattern
             }
         }
 

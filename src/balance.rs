@@ -52,6 +52,7 @@ impl BalanceChecker {
     }
 
     /// Retry balance check with exponential backoff on rate limit errors
+    /// Uses jittered exponential backoff to prevent thundering herd problem
     async fn check_with_retry<F, Fut>(&self, check_fn: F, max_retries: u32) -> Result<f64>
     where
         F: Fn() -> Fut,
@@ -64,12 +65,19 @@ impl BalanceChecker {
                 Ok(balance) => return Ok(balance),
                 Err(e) => {
                     last_error = Some(e);
-                    // If it's a rate limit error, wait and retry
+                    // If it's a rate limit error, wait and retry with jittered exponential backoff
                     if Self::is_rate_limit_error(last_error.as_ref().unwrap()) {
-                        let backoff_secs = 2_u64.pow(attempt.min(5)); // Max 32 seconds
-                        warn!("Rate limited, waiting {} seconds before retry (attempt {}/{})...", 
-                              backoff_secs, attempt + 1, max_retries);
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        // Exponential backoff: 2^attempt seconds (max 32 seconds)
+                        let base_backoff_secs = 2_u64.pow(attempt.min(5));
+                        
+                        // Add jitter to prevent thundering herd problem
+                        // Multiple threads hitting rate limit at the same time will back off at slightly different times
+                        let jitter_ms = Self::calculate_jitter();
+                        let backoff_ms = (base_backoff_secs * 1000) + jitter_ms;
+                        
+                        warn!("Rate limited, waiting {:.2} seconds (with jitter) before retry (attempt {}/{})...", 
+                              backoff_ms as f64 / 1000.0, attempt + 1, max_retries);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
                     } else {
                         // Non-rate-limit error, return immediately
@@ -81,6 +89,20 @@ impl BalanceChecker {
         
         // All retries exhausted
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Max retries exceeded")))
+    }
+    
+    /// Calculate jitter value (0-1000ms) to prevent thundering herd problem
+    /// Uses SystemTime for thread-safe pseudo-random jitter without external dependencies
+    fn calculate_jitter() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // Use current time in nanoseconds to generate pseudo-random jitter
+        // This is thread-safe and doesn't require external dependencies
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+        // Jitter between 0-1000ms
+        nanos % 1000
     }
 
     pub async fn check(&self, wallets: &WalletAddresses) -> Result<BalanceResults> {
