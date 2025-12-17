@@ -132,6 +132,9 @@ async fn main() -> Result<()> {
         0.001
     );
     
+    // Track bloom filter failures to detect if it's consistently failing
+    let bloom_failure_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    
     // Clear bloom filter if starting fresh (not resuming)
     if start_index == 0 {
         bloom_filter.clear();
@@ -208,6 +211,7 @@ async fn main() -> Result<()> {
             warn!("Bloom filter 95% full ({} / {}), clearing to prevent overflow...", 
                   bloom_filter.len(), bloom_filter.capacity());
             bloom_filter.clear();
+            bloom_failure_count.store(0, std::sync::atomic::Ordering::Relaxed); // Reset counter after successful clear
         }
         
         // Add to bloom filter (with graceful degradation on failure)
@@ -220,8 +224,17 @@ async fn main() -> Result<()> {
                 // Pattern might be too large or bloom filter has internal issues
                 // Graceful degradation: continue without duplicate check for this pattern
                 // This is acceptable - we'll process the pattern anyway, just without duplicate detection
-                warn!("Pattern too large for bloom filter after clear: {}. Continuing without duplicate check for this pattern.", e2);
+                let failure_count = bloom_failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                warn!("Pattern too large for bloom filter after clear: {}. Continuing without duplicate check for this pattern. (Total failures: {})", e2, failure_count);
+                
+                // Warn if bloom filter is consistently failing (might indicate a systemic issue)
+                if failure_count % 100 == 0 {
+                    warn!("Bloom filter has failed {} times. Consider increasing bloom_capacity in config or investigating pattern sizes.", failure_count);
+                }
                 // Don't panic - continue processing the pattern
+            } else {
+                // Success after clear - reset failure counter
+                bloom_failure_count.store(0, std::sync::atomic::Ordering::Relaxed);
             }
         }
 

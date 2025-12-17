@@ -115,6 +115,8 @@ impl BalanceChecker {
         let max_retries = self.config.rate_limiting.max_retries;
 
         // Check Bitcoin addresses
+        // Note: If any address check fails completely (both APIs exhausted), we return an error
+        // This prevents missing wallets with balances due to API failures
         for address in &wallets.btc {
             self.rate_limit().await;
 
@@ -133,9 +135,11 @@ impl BalanceChecker {
                     ).await {
                         Ok(b) => b,
                         Err(e2) => {
-                            warn!("Both BTC APIs failed for {} after retries: primary={}, fallback={}. Assuming 0 balance.", address, e, e2);
-                            // Assume 0 balance instead of crashing - don't stop entire process
-                            0.0
+                            // CRITICAL: Both APIs failed - return error instead of assuming 0 balance
+                            // Assuming 0 balance could cause us to miss wallets with actual balances
+                            // The caller should handle this error appropriately (retry, skip, or fail)
+                            warn!("Both BTC APIs failed for {} after retries: primary={}, fallback={}. Skipping address to avoid missing wallets with balances.", address, e, e2);
+                            return Err(anyhow::anyhow!("All BTC API attempts exhausted for {}: primary={}, fallback={}", address, e, e2));
                         }
                     }
                 }

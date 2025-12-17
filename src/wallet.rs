@@ -120,6 +120,11 @@ impl WalletGenerator {
             let pubkey = derived.to_priv().public_key(&self.secp);
             
             // Use correct address type based on derivation path
+            // CRITICAL: Each BIP44 path type has a specific address format
+            // - m/44' = Legacy (P2PKH)
+            // - m/49' = SegWit (P2SH-P2WPKH)
+            // - m/84' = Native SegWit (P2WPKH)
+            // Unknown paths are rejected to prevent generating incorrect addresses
             let address = if path_str.starts_with("m/44'") {
                 // Legacy (P2PKH) - m/44'/0'/0'/0/0
                 bitcoin::Address::p2pkh(&pubkey, Network::Bitcoin)
@@ -127,10 +132,13 @@ impl WalletGenerator {
                 // SegWit (P2SH-P2WPKH) - m/49'/0'/0'/0/0
                 bitcoin::Address::p2shwpkh(&pubkey, Network::Bitcoin)
                     .context("Failed to create SegWit address")?
-            } else {
-                // Native SegWit (P2WPKH) - m/84'/0'/0'/0/0 (default)
+            } else if path_str.starts_with("m/84'") {
+                // Native SegWit (P2WPKH) - m/84'/0'/0'/0/0
                 bitcoin::Address::p2wpkh(&pubkey, Network::Bitcoin)
                     .context("Failed to create Native SegWit address")?
+            } else {
+                // Reject unknown derivation paths to prevent incorrect address generation
+                anyhow::bail!("Unsupported Bitcoin derivation path: {}. Supported paths: m/44' (Legacy), m/49' (SegWit), m/84' (Native SegWit)", path_str);
             };
 
             addresses.push(address.to_string());
@@ -158,9 +166,9 @@ impl WalletGenerator {
         // Ethereum address = last 20 bytes of keccak256(public_key)
         // serialize_uncompressed() returns 65 bytes: 0x04 (1 byte) + X (32 bytes) + Y (32 bytes)
         let pub_bytes_full = public_key.serialize_uncompressed();
-        assert_eq!(pub_bytes_full.len(), 65, "Uncompressed pubkey must be 65 bytes (0x04 + X + Y)");
-        let pub_bytes = &pub_bytes_full[1..]; // Remove 0x04 prefix, get exactly 64 bytes
-        assert_eq!(pub_bytes.len(), 64, "Public key coords must be 64 bytes");
+        assert_eq!(pub_bytes_full.len(), 65, "Uncompressed pubkey must be exactly 65 bytes: 0x04 prefix (1 byte) + X coordinate (32 bytes) + Y coordinate (32 bytes)");
+        let pub_bytes = &pub_bytes_full[1..]; // Remove 0x04 prefix, get exactly 64 bytes (X + Y coordinates)
+        assert_eq!(pub_bytes.len(), 64, "Public key coordinates (X + Y) must be exactly 64 bytes after removing 0x04 prefix");
         let hash = Self::keccak256(pub_bytes);
         let address = hex::encode(&hash[12..]);
 
