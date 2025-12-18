@@ -276,17 +276,19 @@ async fn main() -> Result<()> {
     }
 
     info!("Producer finished: {} patterns sent", sent_count);
-    drop(job_tx); // Signal completion
+    drop(job_tx.clone()); // Signal completion (keep original for aggregator fallback routing)
 
     // Result aggregator task
     let aggregator_handle = tokio::spawn({
         let retry_tx = retry_tx.clone();
+        let job_tx = job_tx.clone();
         let checkpoint_manager = checkpoint_manager.clone();
         let stats = stats.clone();
 
         async move {
             result_aggregator(
                 result_rx,
+                job_tx,
                 retry_tx,
                 checkpoint_manager,
                 stats,
@@ -437,9 +439,12 @@ async fn worker_task(
                 Err(e) => {
                     let error_str = e.to_string();
 
-                    // Detect rate limit
-                    if error_str.contains("429") || error_str.contains("Rate limit") {
-                        warn!("Worker {}: Rate limited at index {}, requeueing...", worker_id, job.index);
+                    // Retryable failures (rate limit storms or incomplete chain checks)
+                    if error_str.contains("429")
+                        || error_str.contains("Rate limit")
+                        || error_str.contains("RETRYABLE_BALANCE_CHECK")
+                    {
+                        warn!("Worker {}: Retryable error at index {}, requeueing... ({})", worker_id, job.index, error_str);
 
                         if job.retry_count < 5 {
                             let mut retry_job = job.clone();
@@ -506,6 +511,7 @@ async fn worker_task(
 
 async fn result_aggregator(
     mut result_rx: mpsc::Receiver<ProcessResult>,
+    job_tx: mpsc::Sender<PatternJob>,
     retry_tx: mpsc::Sender<PatternJob>,
     checkpoint_manager: Arc<CheckpointManager>,
     stats: Arc<Statistics>,
@@ -549,8 +555,21 @@ async fn result_aggregator(
             }
 
             ProcessResult::RateLimited { job } => {
-                if let Err(e) = retry_tx.send(job).await {
-                    error!("Failed to send to retry queue: {}", e);
+                match retry_tx.try_send(job.clone()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(job)) => {
+                        // Avoid blocking the aggregator; fall back to the normal queue.
+                        warn!(
+                            "Retry queue full, pushing job {} back to normal queue (may be rechecked later)",
+                            job.index
+                        );
+                        if let Err(e2) = job_tx.try_send(job) {
+                            warn!("Both retry and normal queues full; dropping job: {}", e2);
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_job)) => {
+                        error!("Retry queue closed; cannot requeue rate-limited job");
+                    }
                 }
             }
 

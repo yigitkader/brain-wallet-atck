@@ -425,4 +425,27 @@ mod tests {
         let parsed: Config = toml::from_str(&toml).unwrap();
         assert_eq!(parsed.attack.max_patterns, config.attack.max_patterns);
     }
+
+    #[test]
+    fn test_validate_rejects_too_many_bip39_passphrases() {
+        let mut config = Config::default();
+        config.optimization.bip39_passphrases = vec![
+            "".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+        ];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("Too many BIP39 passphrases"), "got err: {}", err);
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_rate_limit_overrides() {
+        let mut config = Config::default();
+        config.rate_limiting.eth_min_delay_ms = Some(0);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("rate_limiting.eth_min_delay_ms must be >= 1"), "got err: {}", err);
+    }
 }

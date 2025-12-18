@@ -171,11 +171,9 @@ impl PatternGenerator {
             });
 
         let name_date_iter = dictionaries.names.iter().flat_map(|name| {
-            dictionaries.dates.iter().map(move |date| {
-                AttackPattern::NameDate {
-                    name: name.clone(),
-                    date: date.clone(),
-                }
+            dictionaries.dates_iter().map(move |date| AttackPattern::NameDate {
+                name: name.clone(),
+                date,
             })
         });
 
@@ -200,15 +198,12 @@ impl PatternGenerator {
             .chain(name_date_iter)
     }
 
-    fn generate_mutations_iter(
-        word: &String,
-        max_mutations_per_word: usize,
-    ) -> impl Iterator<Item = AttackPattern> {
+    fn generate_mutations_iter(word: &str, max_mutations_per_word: usize) -> impl Iterator<Item = AttackPattern> {
         let mut mutations = Vec::new();
         let mut word_mutations = 0;
 
         if word_mutations < max_mutations_per_word {
-            let mut leet = word.clone();
+            let mut leet = word.to_owned();
             leet = leet.replace('a', "4");
             leet = leet.replace('e', "3");
             leet = leet.replace('i', "1");
@@ -238,7 +233,12 @@ impl PatternGenerator {
                 break;
             }
             mutations.push(AttackPattern::SingleWord {
-                word: format!("{}{}", word, suffix),
+                word: {
+                    let mut s = String::with_capacity(word.len() + suffix.len());
+                    s.push_str(word);
+                    s.push_str(suffix);
+                    s
+                },
             });
             word_mutations += 1;
         }
@@ -249,7 +249,12 @@ impl PatternGenerator {
                 break;
             }
             mutations.push(AttackPattern::SingleWord {
-                word: format!("{}{}", prefix, word),
+                word: {
+                    let mut s = String::with_capacity(prefix.len() + word.len());
+                    s.push_str(prefix);
+                    s.push_str(word);
+                    s
+                },
             });
             word_mutations += 1;
         }
@@ -324,10 +329,10 @@ impl PatternGenerator {
         }
 
         for name in &dictionaries.names {
-            for date in &dictionaries.dates {
+            for date in dictionaries.dates_iter() {
                 patterns.push(AttackPattern::NameDate {
                     name: name.clone(),
-                    date: date.clone(),
+                    date,
                 });
             }
         }
@@ -383,7 +388,12 @@ impl PatternGenerator {
                     break;
                 }
                 mutations.push(AttackPattern::SingleWord {
-                    word: format!("{}{}", word, suffix),
+                    word: {
+                        let mut s = String::with_capacity(word.len() + suffix.len());
+                        s.push_str(word);
+                        s.push_str(suffix);
+                        s
+                    },
                 });
                 word_mutations += 1;
             }
@@ -394,7 +404,12 @@ impl PatternGenerator {
                     break;
                 }
                 mutations.push(AttackPattern::SingleWord {
-                    word: format!("{}{}", prefix, word),
+                    word: {
+                        let mut s = String::with_capacity(prefix.len() + word.len());
+                        s.push_str(prefix);
+                        s.push_str(word);
+                        s
+                    },
                 });
                 word_mutations += 1;
             }

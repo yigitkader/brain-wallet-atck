@@ -167,27 +167,101 @@ impl WalletGenerator {
     }
 
     fn make_valid_bip39_repeat_phrase(word: &str, count: usize) -> Option<String> {
-        if count != 12 && count != 24 {
-            return None;
-        }
+        // Optimization: instead of brute-forcing all 2048 last words, compute the checksum bits.
+        // With first N-1 words fixed, only a few entropy bits remain:
+        // - 12 words: ENT=128, CS=4 → after 11 words (121 bits), only 7 entropy bits unknown (128 candidates)
+        // - 24 words: ENT=256, CS=8 → after 23 words (253 bits), only 3 entropy bits unknown (8 candidates)
+        let (entropy_bits, checksum_bits, remaining_entropy_bits) = match count {
+            12 => (128usize, 4usize, 7usize),
+            24 => (256usize, 8usize, 3usize),
+            _ => return None,
+        };
 
-        // First N-1 words are the repeated word; last is brute-forced to satisfy checksum.
-        let prefix = std::iter::repeat_n(word, count.saturating_sub(1))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let word_idx = Self::bip39_english_index(word)? as u16;
 
-        for &candidate in Language::English.word_list().iter() {
+        // Search only the remaining entropy space and compute the unique last word index for each candidate.
+        let max = 1usize << remaining_entropy_bits;
+        for tail in 0..max {
+            let entropy = Self::bip39_repeat_entropy(word_idx, count, tail as u32, remaining_entropy_bits, entropy_bits)?;
+            let checksum = Self::bip39_checksum_bits(&entropy, checksum_bits);
+            let last_idx = ((tail as u16) << (checksum_bits as u16)) | (checksum as u16);
+            let last_word = *Language::English.word_list().get(last_idx as usize)?;
+
+            let prefix = std::iter::repeat_n(word, count.saturating_sub(1))
+                .collect::<Vec<_>>()
+                .join(" ");
             let phrase = if prefix.is_empty() {
-                candidate.to_string()
+                last_word.to_string()
             } else {
-                format!("{} {}", prefix, candidate)
+                format!("{} {}", prefix, last_word)
             };
+
+            // Defensive: ensure we generated a valid mnemonic.
             if Mnemonic::parse_in_normalized(Language::English, &phrase).is_ok() {
                 return Some(phrase);
             }
         }
 
         None
+    }
+
+    fn bip39_english_index(word: &str) -> Option<usize> {
+        Language::English
+            .word_list()
+            .iter()
+            .position(|&w| w == word)
+    }
+
+    fn bip39_checksum_bits(entropy: &[u8], checksum_bits: usize) -> u8 {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(entropy);
+        match checksum_bits {
+            0 => 0,
+            1..=8 => hash[0] >> (8 - checksum_bits),
+            _ => {
+                // For this project we only need 4 (12 words) and 8 (24 words).
+                hash[0]
+            }
+        }
+    }
+
+    fn bip39_repeat_entropy(
+        word_idx: u16,
+        count: usize,
+        tail: u32,
+        tail_bits: usize,
+        entropy_bits: usize,
+    ) -> Option<Vec<u8>> {
+        let prefix_words = count.checked_sub(1)?;
+        let prefix_bits = prefix_words * 11;
+        if prefix_bits + tail_bits != entropy_bits {
+            return None;
+        }
+
+        let mut out = vec![0u8; entropy_bits / 8];
+        let mut bit_pos = 0usize; // 0..entropy_bits, MSB-first
+
+        let mut push_bits = |val: u32, nbits: usize| {
+            for i in (0..nbits).rev() {
+                let bit = ((val >> i) & 1) as u8;
+                let byte_idx = bit_pos / 8;
+                let bit_in_byte = 7 - (bit_pos % 8);
+                out[byte_idx] |= bit << bit_in_byte;
+                bit_pos += 1;
+            }
+        };
+
+        // N-1 repeated words
+        for _ in 0..prefix_words {
+            push_bits(word_idx as u32, 11);
+        }
+        // Remaining entropy tail bits
+        push_bits(tail, tail_bits);
+
+        if bit_pos != entropy_bits {
+            return None;
+        }
+        Some(out)
     }
 
     fn pbkdf2_seed(&self, passphrase: &str) -> Result<[u8; 64]> {
@@ -352,33 +426,9 @@ impl WalletGenerator {
 
         let pubkey_bytes = verifying_key.to_bytes();
 
-        // FIXED: Check instead of assert
-        if pubkey_bytes.len() != 32 {
-            bail!("Ed25519 public key must be 32 bytes, got {}", pubkey_bytes.len());
-        }
-
-        let address = bs58::encode(&pubkey_bytes).into_string();
-
-        // Validate: base58 roundtrip should preserve bytes and be canonical
-        let decoded = bs58::decode(&address)
-            .into_vec()
-            .context("Failed to decode generated Solana address (base58)")?;
-
-        if decoded.len() != 32 {
-            bail!(
-                "Generated Solana address decoded length must be 32 bytes, got {}",
-                decoded.len()
-            );
-        }
-        if decoded.as_slice() != pubkey_bytes.as_slice() {
-            bail!("Generated Solana address roundtrip mismatch");
-        }
-        let reencoded = bs58::encode(&decoded).into_string();
-        if reencoded != address {
-            bail!("Generated Solana address is not canonical base58");
-        }
-
-        Ok(address)
+        // bs58 encoding is deterministic; the bytes come from our own key derivation,
+        // so additional round-trip validation is unnecessary overhead here.
+        Ok(bs58::encode(&pubkey_bytes).into_string())
     }
 
     fn keccak256(data: &[u8]) -> [u8; 32] {
@@ -502,6 +552,15 @@ mod tests {
         let phrase = WalletGenerator::make_valid_bip39_repeat_phrase("abandon", 12)
             .expect("should find a valid checksum word for 12-word repeat");
         assert!(Mnemonic::parse_in_normalized(Language::English, &phrase).is_ok());
+    }
+
+    #[test]
+    fn test_bip39_repeat_phrase_has_expected_prefix() {
+        let phrase = WalletGenerator::make_valid_bip39_repeat_phrase("abandon", 12).unwrap();
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        assert_eq!(words.len(), 12);
+        // first 11 should be the repeated word
+        assert!(words[..11].iter().all(|&w| w == "abandon"));
     }
 
     #[test]

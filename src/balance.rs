@@ -222,23 +222,8 @@ impl BalanceChecker {
     }
 
     fn calculate_jitter() -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        use std::time::{SystemTime, UNIX_EPOCH};
-        use std::thread;
-
-        let thread_id = thread::current().id();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-
-        let mut hasher = DefaultHasher::new();
-        thread_id.hash(&mut hasher);
-        nanos.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        hash % 1000
+        use rand::Rng;
+        rand::thread_rng().gen_range(0..1000)
     }
 
     /// Check balances for all wallet addresses
@@ -251,6 +236,7 @@ impl BalanceChecker {
         };
 
         let max_retries = self.config.rate_limiting.max_retries;
+        let mut incomplete_errors: Vec<String> = Vec::new();
 
         // Check Bitcoin addresses
         for address in &wallets.btc {
@@ -269,11 +255,9 @@ impl BalanceChecker {
                     ).await {
                         Ok(b) => b,
                         Err(e2) => {
-                            // FIXED: Return error to trigger retry in worker
-                            // This allows the pattern to be re-queued instead of lost
                             warn!("Both BTC APIs failed for {} after retries: primary={}, fallback={}", address, e, e2);
                             return Err(anyhow::anyhow!(
-                                "All BTC API attempts exhausted for {}: primary={}, fallback={}",
+                                "RETRYABLE_BALANCE_CHECK: All BTC API attempts exhausted for {}: primary={}, fallback={}",
                                 address, e, e2
                             ));
                         }
@@ -317,6 +301,10 @@ impl BalanceChecker {
                                     "All ETH API attempts failed for {}: primary={}, blockcypher={}, blockchair={}. Continuing with other chains.",
                                     wallets.eth, e, e2, e3
                                 );
+                                incomplete_errors.push(format!(
+                                    "ETH failed for {}: primary={}, blockcypher={}, blockchair={}",
+                                    wallets.eth, e, e2, e3
+                                ));
                             }
                         }
                     }
@@ -362,9 +350,22 @@ impl BalanceChecker {
                             "All SOL RPC attempts failed for {}. Last error: {}. Continuing with other chains.",
                             sol_address, last
                         );
+                        incomplete_errors.push(format!(
+                            "SOL failed for {}: {}",
+                            sol_address,
+                            last
+                        ));
                     }
                 }
             }
+        }
+
+        // If any enabled chain could not be checked and we found nothing elsewhere, retry the pattern.
+        if results.is_empty() && !incomplete_errors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "RETRYABLE_BALANCE_CHECK: Incomplete chain checks: {}",
+                incomplete_errors.join(" | ")
+            ));
         }
 
         Ok(results)
@@ -754,5 +755,43 @@ mod tests {
 
         let res = checker.check(&wallets).await.unwrap();
         assert_eq!(res.sol, Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_chain_checks_are_retryable_when_no_balance_found() {
+        let mut http = MockHttp::new();
+        http.expect_get()
+            .returning(|_url| Box::pin(async { Ok((500, r#"{"result":"0"}"#.to_string())) }));
+        http.expect_post_json()
+            .returning(|_url, _body| Box::pin(async { Ok((500, r#"{}"#.to_string())) }));
+
+        let mut config = Config::default();
+        config.rate_limiting.min_delay_ms = 1;
+        config.rate_limiting.batch_cooldown_ms = 0;
+        config.rate_limiting.max_retries = 1;
+
+        let limiter = Arc::new(SharedRateLimiter::new(0, 0, 50));
+        let http: Arc<dyn HttpClient> = Arc::new(http);
+        let checker = BalanceChecker::new_for_test(
+            &config,
+            http,
+            limiter.clone(),
+            limiter.clone(),
+            limiter.clone(),
+            "https://api.etherscan.io".to_string(),
+            "https://api.blockcypher.com".to_string(),
+            "https://api.blockchair.com".to_string(),
+            vec!["https://api.mainnet-beta.solana.com".to_string()],
+        );
+
+        let wallets = WalletAddresses {
+            btc: vec![],
+            eth: "0x0000000000000000000000000000000000000000".to_string(),
+            sol: None,
+            bip39_passphrase: None,
+        };
+
+        let err = checker.check(&wallets).await.unwrap_err().to_string();
+        assert!(err.contains("RETRYABLE_BALANCE_CHECK"), "got err: {}", err);
     }
 }

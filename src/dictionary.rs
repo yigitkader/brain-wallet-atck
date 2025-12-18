@@ -26,18 +26,85 @@ pub struct Dictionaries {
     pub crypto: Vec<String>,
     pub weak_seeds: Vec<String>,
     pub names: Vec<String>,
-    pub dates: Vec<String>,
+    pub dates_start_year: u32,
+    pub dates_end_year: u32,
 }
 
 impl Dictionaries {
     pub fn total_entries(&self) -> usize {
+        let years = if self.dates_end_year >= self.dates_start_year {
+            (self.dates_end_year - self.dates_start_year + 1) as usize
+        } else {
+            0
+        };
+        // Matches `dates_iter()` below:
+        // per year: 2 (yyyy, yy)
+        // per month: 3 (yyyymm, yymm, yyyy-mm)
+        // per day (1..=28): 2 (yyyymmdd, yymmdd)
+        let dates_estimate = years * (2 + (12 * (3 + (28 * 2))));
+
         self.passwords.len()
             + self.bip39.len()
             + self.phrases.len()
             + self.crypto.len()
             + self.weak_seeds.len()
             + self.names.len()
-            + self.dates.len()
+            + dates_estimate
+    }
+
+    pub fn dates_iter(&self) -> impl Iterator<Item = String> + '_ {
+        let start_year = self.dates_start_year;
+        let end_year = self.dates_end_year;
+
+        (start_year..=end_year).flat_map(move |year| {
+            let yy = year % 100;
+            // year-only entries
+            std::iter::once(format!("{:04}", year))
+                .chain(std::iter::once(format!("{:02}", yy)))
+                .chain((1u32..=12).flat_map(move |month| {
+                    // year-month entries
+                    std::iter::once(format!("{:04}{:02}", year, month))
+                        .chain(std::iter::once(format!("{:02}{:02}", yy, month)))
+                        .chain(std::iter::once(format!("{:04}-{:02}", year, month)))
+                        .chain((1u32..=28).flat_map(move |day| {
+                            // year-month-day entries
+                            std::iter::once(format!("{:04}{:02}{:02}", year, month, day))
+                                .chain(std::iter::once(format!("{:02}{:02}{:02}", yy, month, day)))
+                        }))
+                }))
+        })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dates_iter_small_range_count_and_samples() {
+        let dicts = Dictionaries {
+            dates_start_year: 2000,
+            dates_end_year: 2000,
+            ..Default::default()
+        };
+
+        let dates: Vec<String> = dicts.dates_iter().collect();
+
+        // Per year:
+        // 2 (yyyy, yy)
+        // + 12 * (3 (yyyymm, yymm, yyyy-mm) + 28*2 (yyyymmdd, yymmdd))
+        let expected = 2 + (12 * (3 + (28 * 2)));
+        assert_eq!(dates.len(), expected);
+
+        // A few representative samples should exist.
+        assert!(dates.contains(&"2000".to_string()));
+        assert!(dates.contains(&"00".to_string()));
+        assert!(dates.contains(&"200001".to_string()));
+        assert!(dates.contains(&"0001".to_string()));
+        assert!(dates.contains(&"2000-01".to_string()));
+        assert!(dates.contains(&"20000101".to_string()));
+        assert!(dates.contains(&"000101".to_string()));
     }
 }
 
@@ -261,8 +328,11 @@ impl DictionaryLoader {
         info!("Loaded {} names", dicts.names.len());
 
         info!("Generating dates...");
-        dicts.dates = Self::generate_dates(1950, 2025);
-        info!("Generated {} dates", dicts.dates.len());
+        dicts.dates_start_year = 1950;
+        dicts.dates_end_year = 2025;
+        let years = (dicts.dates_end_year - dicts.dates_start_year + 1) as usize;
+        let dates_estimate = years * (2 + (12 * (3 + (28 * 2))));
+        info!("Dates configured: {}..={} (~{} entries)", dicts.dates_start_year, dicts.dates_end_year, dates_estimate);
 
         Ok(dicts)
     }
@@ -348,27 +418,7 @@ impl DictionaryLoader {
         }
     }
 
-    fn generate_dates(start_year: u32, end_year: u32) -> Vec<String> {
-        let mut dates = Vec::new();
-
-        for year in start_year..=end_year {
-            dates.push(format!("{:04}", year));
-            dates.push(format!("{:02}", year % 100));
-
-            for month in 1..=12 {
-                dates.push(format!("{:04}{:02}", year, month));
-                dates.push(format!("{:02}{:02}", year % 100, month));
-                dates.push(format!("{:04}-{:02}", year, month));
-
-                for day in 1..=28 {
-                    dates.push(format!("{:04}{:02}{:02}", year, month, day));
-                    dates.push(format!("{:02}{:02}{:02}", year % 100, month, day));
-                }
-            }
-        }
-
-        dates
-    }
+    // Dates are generated lazily via `Dictionaries::dates_iter()`.
 
     fn generate_default_names() -> Vec<String> {
         vec![
