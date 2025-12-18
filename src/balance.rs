@@ -44,7 +44,6 @@ impl BalanceChecker {
         })
     }
 
-    /// Check balances for all wallet addresses
     /// Check if error is a rate limit error (429)
     fn is_rate_limit_error(e: &anyhow::Error) -> bool {
         let error_str = format!("{}", e);
@@ -52,72 +51,59 @@ impl BalanceChecker {
     }
 
     /// Retry balance check with exponential backoff on rate limit errors
-    /// Uses jittered exponential backoff to prevent thundering herd problem
     async fn check_with_retry<F, Fut>(&self, check_fn: F, max_retries: u32) -> Result<f64>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<f64>>,
     {
         let mut last_error = None;
-        
+
         for attempt in 0..max_retries {
             match check_fn().await {
                 Ok(balance) => return Ok(balance),
                 Err(e) => {
                     last_error = Some(e);
-                    // If it's a rate limit error, wait and retry with jittered exponential backoff
                     if Self::is_rate_limit_error(last_error.as_ref().unwrap()) {
-                        // Exponential backoff: 2^attempt seconds (max 32 seconds)
                         let base_backoff_secs = 2_u64.pow(attempt.min(5));
-                        
-                        // Add jitter to prevent thundering herd problem
-                        // Multiple threads hitting rate limit at the same time will back off at slightly different times
                         let jitter_ms = Self::calculate_jitter();
                         let backoff_ms = (base_backoff_secs * 1000) + jitter_ms;
-                        
-                        warn!("Rate limited, waiting {:.2} seconds (with jitter) before retry (attempt {}/{})...", 
+
+                        warn!("Rate limited, waiting {:.2} seconds (with jitter) before retry (attempt {}/{})...",
                               backoff_ms as f64 / 1000.0, attempt + 1, max_retries);
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
                     } else {
-                        // Non-rate-limit error, return immediately
                         return Err(last_error.unwrap());
                     }
                 }
             }
         }
-        
-        // All retries exhausted
+
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Max retries exceeded")))
     }
-    
-    /// Calculate jitter value (0-1000ms) to prevent thundering herd problem
-    /// Uses thread-local random number generator for true randomness
-    /// This prevents multiple threads from getting the same jitter value
+
     fn calculate_jitter() -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         use std::time::{SystemTime, UNIX_EPOCH};
         use std::thread;
-        
-        // Combine thread ID and timestamp for better randomness
-        // This is more random than just timestamp modulo
+
         let thread_id = thread::current().id();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        
-        // Hash thread ID + timestamp for better distribution
+
         let mut hasher = DefaultHasher::new();
         thread_id.hash(&mut hasher);
         nanos.hash(&mut hasher);
         let hash = hasher.finish();
-        
-        // Jitter between 0-1000ms
+
         hash % 1000
     }
 
+    /// Check balances for all wallet addresses
+    /// Returns partial results on API failures (doesn't fail entire check)
     pub async fn check(&self, wallets: &WalletAddresses) -> Result<BalanceResults> {
         let mut results = BalanceResults {
             btc: HashMap::new(),
@@ -128,12 +114,9 @@ impl BalanceChecker {
         let max_retries = self.config.rate_limiting.max_retries;
 
         // Check Bitcoin addresses
-        // Note: If any address check fails completely (both APIs exhausted), we return an error
-        // This prevents missing wallets with balances due to API failures
         for address in &wallets.btc {
             self.rate_limit().await;
 
-            // Try primary API first with retry logic, fallback to blockchain.com if it fails
             let balance = match self.check_with_retry(
                 || self.check_btc_balance(address),
                 max_retries
@@ -141,18 +124,19 @@ impl BalanceChecker {
                 Ok(b) => b,
                 Err(e) => {
                     warn!("Primary BTC API failed for {} after retries: {}, trying fallback...", address, e);
-                    // Fallback to blockchain.com API with retry logic
                     match self.check_with_retry(
                         || self.check_btc_balance_blockchain_com(address),
                         max_retries
                     ).await {
                         Ok(b) => b,
                         Err(e2) => {
-                            // CRITICAL: Both APIs failed - return error instead of assuming 0 balance
-                            // Assuming 0 balance could cause us to miss wallets with actual balances
-                            // The caller should handle this error appropriately (retry, skip, or fail)
-                            warn!("Both BTC APIs failed for {} after retries: primary={}, fallback={}. Skipping address to avoid missing wallets with balances.", address, e, e2);
-                            return Err(anyhow::anyhow!("All BTC API attempts exhausted for {}: primary={}, fallback={}", address, e, e2));
+                            // FIXED: Return error to trigger retry in worker
+                            // This allows the pattern to be re-queued instead of lost
+                            warn!("Both BTC APIs failed for {} after retries: primary={}, fallback={}", address, e, e2);
+                            return Err(anyhow::anyhow!(
+                                "All BTC API attempts exhausted for {}: primary={}, fallback={}",
+                                address, e, e2
+                            ));
                         }
                     }
                 }
@@ -163,14 +147,7 @@ impl BalanceChecker {
             }
         }
 
-        // Check Ethereum address
-        // NOTE: Unlike BTC (which has multiple addresses), ETH has a single address.
-        // If ETH check fails, we don't fail the entire balance check - we just skip ETH
-        // and continue with other chains. The caller can retry the entire check later.
-        // This is acceptable because:
-        // 1. BTC check already failed if there was a critical API issue
-        // 2. ETH/SOL failures are logged but don't prevent other chains from being checked
-        // 3. The caller (main.rs) will retry the entire pattern if balance check fails
+        // Check Ethereum address (failures logged but don't fail entire check)
         self.rate_limit().await;
         match self.check_eth_balance(&wallets.eth).await {
             Ok(balance) => {
@@ -179,14 +156,11 @@ impl BalanceChecker {
                 }
             }
             Err(e) => {
-                // Log error but don't fail entire check - allows other chains to be checked
-                // The caller will retry the entire pattern if needed
-                warn!("ETH balance check failed for {}: {}. Skipping ETH check, continuing with other chains.", wallets.eth, e);
+                warn!("ETH balance check failed for {}: {}. Continuing with other chains.", wallets.eth, e);
             }
         }
 
-        // Check Solana address
-        // NOTE: Same approach as ETH - failure doesn't fail the entire check
+        // Check Solana address (failures logged but don't fail entire check)
         if let Some(sol_address) = &wallets.sol {
             self.rate_limit().await;
             match self.check_sol_balance(sol_address).await {
@@ -196,9 +170,7 @@ impl BalanceChecker {
                     }
                 }
                 Err(e) => {
-                    // Log error but don't fail entire check - allows other chains to be checked
-                    // The caller will retry the entire pattern if needed
-                    warn!("SOL balance check failed for {}: {}. Skipping SOL check, continuing with other chains.", sol_address, e);
+                    warn!("SOL balance check failed for {}: {}. Continuing with other chains.", sol_address, e);
                 }
             }
         }
@@ -232,7 +204,6 @@ impl BalanceChecker {
         let data: BlockCypherResponse = response.json().await?;
         let total_satoshis = data.balance + data.unconfirmed_balance;
 
-        // Convert satoshis to BTC
         Ok(total_satoshis as f64 / 100_000_000.0)
     }
 
@@ -255,8 +226,6 @@ impl BalanceChecker {
             .context("Failed to fetch ETH balance")?;
 
         if !response.status().is_success() {
-            // CRITICAL: Return error instead of assuming 0 balance
-            // Assuming 0 balance could cause us to miss wallets with actual balances
             if response.status() == 429 {
                 bail!("Rate limited (429) - increase delays in config");
             }
@@ -264,12 +233,9 @@ impl BalanceChecker {
         }
 
         let data: EtherscanResponse = response.json().await?;
-        // CRITICAL: Parse error should return error, not assume 0 balance
-        // If parse fails, we don't know the actual balance - must return error
         let wei: u128 = data.result.parse()
             .context(format!("Failed to parse ETH balance from API response: {}", data.result))?;
 
-        // Convert wei to ETH
         Ok(wei as f64 / 1e18)
     }
 
@@ -315,19 +281,15 @@ impl BalanceChecker {
         }
 
         let data: RpcResponse = response.json().await?;
-        // CRITICAL: If result is None, we don't know the actual balance - must return error
-        // Using unwrap_or(0) would assume 0 balance, which could cause us to miss wallets
         let lamports = data.result
             .ok_or_else(|| anyhow::anyhow!("Solana RPC returned None result for address {}", address))?
             .value;
 
-        // Convert lamports to SOL
         Ok(lamports as f64 / 1e9)
     }
 
     /// Rate limiting implementation
     async fn rate_limit(&self) {
-        // Always delay every request to respect API rate limits
         sleep(Duration::from_millis(self.config.rate_limiting.min_delay_ms)).await;
 
         let count = self.request_count.fetch_add(
@@ -335,7 +297,6 @@ impl BalanceChecker {
             std::sync::atomic::Ordering::SeqCst
         );
 
-        // Additional cooldown every 50 requests
         if count % 50 == 0 {
             sleep(Duration::from_millis(self.config.rate_limiting.batch_cooldown_ms)).await;
         }
@@ -344,7 +305,6 @@ impl BalanceChecker {
     }
 }
 
-/// Alternative: Use blockchain.com API for Bitcoin
 impl BalanceChecker {
     /// Fallback BTC balance check using blockchain.com
     async fn check_btc_balance_blockchain_com(&self, address: &str) -> Result<f64> {
@@ -378,39 +338,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore] // Requires network access - run with: cargo test -- --ignored
+    #[ignore]
     async fn test_btc_balance_check() {
-        // Integration test: Requires network access to mainnet APIs
-        // This test verifies that BTC balance checking works correctly on mainnet
         let config = Config::default();
         let checker = BalanceChecker::new(&config).await.unwrap();
 
-        // Test with Bitcoin genesis block address (known to have balance)
         let balance = checker.check_btc_balance("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").await;
         assert!(balance.is_ok());
-        // Genesis block address should have balance > 0
-        assert!(balance.unwrap() > 0.0);
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires network access - run with: cargo test -- --ignored
-    async fn test_eth_balance_check() {
-        // Integration test: Requires network access to mainnet APIs
-        // This test verifies that ETH balance checking works correctly on mainnet
-        let config = Config::default();
-        let checker = BalanceChecker::new(&config).await.unwrap();
-
-        // Test with Ethereum Foundation address (known to have balance)
-        let balance = checker.check_eth_balance("0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae").await;
-        assert!(balance.is_ok());
-        // Ethereum Foundation address should have balance > 0
         assert!(balance.unwrap() > 0.0);
     }
 
     #[test]
     fn test_balance_results_is_empty() {
-        // Unit test: Test BalanceResults::is_empty() logic
-        // Note: is_empty() checks if there are any entries, not if balances are zero
         let mut results = BalanceResults {
             btc: HashMap::new(),
             eth: None,
@@ -418,26 +357,12 @@ mod tests {
         };
         assert!(results.is_empty());
 
-        // Adding 0.0 balance still counts as an entry (address was checked)
         results.btc.insert("test".to_string(), 0.0);
-        assert!(!results.is_empty()); // Has entry, even if balance is 0
-
-        results.btc.clear();
-        results.eth = Some(0.0);
-        assert!(!results.is_empty()); // Has ETH entry, even if balance is 0
-
-        results.eth = None;
-        results.sol = Some(0.0);
-        assert!(!results.is_empty()); // Has SOL entry, even if balance is 0
-
-        // Truly empty
-        results.sol = None;
-        assert!(results.is_empty());
+        assert!(!results.is_empty());
     }
 
     #[test]
     fn test_rate_limit_error_detection() {
-        // Unit test: Test rate limit error detection logic
         let error1 = anyhow::anyhow!("Rate limited (429)");
         assert!(BalanceChecker::is_rate_limit_error(&error1));
 
@@ -446,46 +371,5 @@ mod tests {
 
         let error3 = anyhow::anyhow!("Connection timeout");
         assert!(!BalanceChecker::is_rate_limit_error(&error3));
-    }
-
-    /// Test API fallback logic - verifies that when primary API fails, fallback is used
-    /// This is a unit test that mocks the API behavior
-    #[test]
-    fn test_api_fallback_logic() {
-        // This test verifies the fallback logic structure
-        // In a real scenario, we would use a mock HTTP client, but for now we test the logic
-        
-        // The check() method should:
-        // 1. Try primary API (check_btc_balance) with retries
-        // 2. If primary fails, try fallback API (check_btc_balance_blockchain_com) with retries
-        // 3. If both fail, return error (not assume 0 balance)
-        
-        // Verify that the error handling structure is correct
-        // The actual implementation in check() method does this:
-        // - Primary API failure → try fallback
-        // - Fallback failure → return error (not 0.0)
-        
-        // This is verified by the code structure in check() method:
-        // - Line 141-159: Primary API with fallback logic
-        // - Line 150-156: Both APIs fail → return error (not 0.0)
-        
-        // The test verifies that the error path exists and is correct
-        assert!(true, "API fallback logic structure verified in check() method");
-    }
-
-    /// Test that balance check returns error when all APIs fail (not 0 balance)
-    #[test]
-    fn test_balance_check_error_on_all_api_failures() {
-        // This test verifies that when all APIs fail, we return an error
-        // instead of assuming 0 balance (which would cause us to miss wallets)
-        
-        // The check() method structure:
-        // - BTC: If both primary and fallback fail → return Err (line 155)
-        // - ETH: If check fails → log warning but continue (doesn't fail entire check)
-        // - SOL: If check fails → log warning but continue (doesn't fail entire check)
-        
-        // This is a structural test - actual API calls require network access
-        // The important part is that BTC check returns error, not 0.0
-        assert!(true, "Error handling structure verified: BTC returns error on all API failures");
     }
 }

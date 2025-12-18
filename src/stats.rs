@@ -1,7 +1,3 @@
-// ============================================================================
-// stats.rs - Real-time Statistics Tracking
-// ============================================================================
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Statistics {
     checked: AtomicU64,
     found: AtomicU64,
-    start_time: AtomicU64, // Unix timestamp in seconds (thread-safe)
+    start_time: AtomicU64,
 }
 
 impl Statistics {
@@ -60,7 +56,6 @@ impl Statistics {
         }
     }
 
-    /// Reset statistics (useful when starting fresh)
     pub fn reset(&self) {
         self.checked.store(0, Ordering::Relaxed);
         self.found.store(0, Ordering::Relaxed);
@@ -71,19 +66,102 @@ impl Statistics {
         self.start_time.store(now, Ordering::Relaxed);
     }
 
-    /// Restore statistics from checkpoint (useful when resuming)
-    /// start_time: Unix timestamp in seconds (None = keep current start_time, Some(t) = restore original start time)
+    /// FIXED: Always restore start_time if provided (don't keep current)
     pub fn restore(&self, checked: u64, found: u64, start_time: Option<u64>) {
         self.checked.store(checked, Ordering::Relaxed);
         self.found.store(found, Ordering::Relaxed);
-        // Restore original start_time if provided, for accurate rate calculation when resuming
-        if let Some(original_start) = start_time {
-            self.start_time.store(original_start, Ordering::Relaxed);
-        }
+
+        // FIXED: Always restore start_time, or use current if not provided
+        let time_to_set = start_time.unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+
+        self.start_time.store(time_to_set, Ordering::Relaxed);
     }
-    
-    /// Get start time (for checkpoint saving)
+
     pub fn start_time(&self) -> u64 {
         self.start_time.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_statistics_basic() {
+        let stats = Statistics::new();
+
+        assert_eq!(stats.checked(), 0);
+        assert_eq!(stats.found(), 0);
+
+        stats.increment_checked();
+        stats.increment_found();
+
+        assert_eq!(stats.checked(), 1);
+        assert_eq!(stats.found(), 1);
+    }
+
+    #[test]
+    fn test_statistics_restore() {
+        let stats = Statistics::new();
+
+        stats.restore(100, 5, Some(1234567890));
+
+        assert_eq!(stats.checked(), 100);
+        assert_eq!(stats.found(), 5);
+        assert_eq!(stats.start_time(), 1234567890);
+    }
+
+    #[test]
+    fn test_statistics_restore_without_start_time() {
+        let stats = Statistics::new();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        stats.restore(50, 2, None);
+
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        assert_eq!(stats.checked(), 50);
+        assert_eq!(stats.found(), 2);
+        assert!(stats.start_time() >= before);
+        assert!(stats.start_time() <= after);
+    }
+
+    #[test]
+    fn test_statistics_rate_calculation() {
+        let stats = Statistics::new();
+
+        // Set a fixed start time (1 second ago)
+        let one_sec_ago = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() - 1;
+        stats.restore(100, 5, Some(one_sec_ago));
+
+        let rate = stats.get_rate();
+        assert!(rate >= 50.0); // ~100 checked / ~2 seconds
+    }
+
+    #[test]
+    fn test_statistics_reset() {
+        let stats = Statistics::new();
+
+        stats.increment_checked();
+        stats.increment_found();
+
+        stats.reset();
+
+        assert_eq!(stats.checked(), 0);
+        assert_eq!(stats.found(), 0);
     }
 }

@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tokio::sync::mpsc;
+use tracing::{info, warn, error};
 
 mod config;
 mod dictionary;
@@ -50,14 +51,39 @@ struct Args {
     /// Generate default config file and exit
     #[arg(long)]
     generate_config: bool,
+
+    /// Number of worker threads (default: 4)
+    #[arg(short = 'w', long, default_value = "4")]
+    workers: usize,
+}
+
+/// Pattern with retry metadata
+#[derive(Clone)]
+struct PatternJob {
+    pattern: pattern::AttackPattern,
+    index: usize,
+    retry_count: u32,
+}
+
+/// Result of pattern processing
+enum ProcessResult {
+    Success {
+        index: usize,
+        found: bool,
+    },
+    RateLimited {
+        job: PatternJob,
+    },
+    Failed {
+        index: usize,
+        error: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse CLI arguments
     let args = Args::parse();
 
-    // Handle --generate-config flag
     if args.generate_config {
         let config_content = Config::default_toml();
         std::fs::write("config.toml", config_content)?;
@@ -65,16 +91,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging
     init_logging(args.verbose)?;
-
-    // Display banner
     display_banner();
 
-    // Ensure output directory exists
     std::fs::create_dir_all("output")?;
 
-    // Load configuration (create default if doesn't exist)
     let config = if !std::path::Path::new(&args.config).exists() {
         warn!("Config file not found: {}. Creating default config...", args.config);
         Config::save_default(&args.config)?;
@@ -84,22 +105,18 @@ async fn main() -> Result<()> {
     };
     info!("Configuration loaded from: {}", args.config);
 
-    // Override max patterns if specified
     let max_patterns = args.max_patterns.unwrap_or(config.attack.max_patterns);
 
-    // Initialize checkpoint manager
-    let checkpoint_manager = CheckpointManager::new("output/checkpoint.json")?;
-    
-    // Clear checkpoint if requested
+    let checkpoint_manager = Arc::new(CheckpointManager::new("output/checkpoint.json")?);
+
     if args.clear_checkpoint {
         checkpoint_manager.clear()?;
         info!("Checkpoint cleared, starting fresh");
     }
-    
-    // Load checkpoint data (index and statistics)
+
     let (start_index, checkpoint_stats) = if args.resume {
         if let Some(checkpoint) = checkpoint_manager.load_full()? {
-            info!("Resuming from checkpoint: index={}, checked={}, found={}, start_time={:?}", 
+            info!("Resuming from checkpoint: index={}, checked={}, found={}, start_time={:?}",
                   checkpoint.last_index, checkpoint.checked, checkpoint.found, checkpoint.start_time);
             (checkpoint.last_index, Some((checkpoint.checked, checkpoint.found, checkpoint.start_time)))
         } else {
@@ -110,11 +127,9 @@ async fn main() -> Result<()> {
     };
 
     info!("Starting from index: {}", start_index);
-    
-    // Initialize statistics
+
     let stats = Arc::new(Statistics::new());
-    
-    // Restore statistics from checkpoint if resuming, otherwise reset
+
     if let Some((checked, found, start_time)) = checkpoint_stats {
         stats.restore(checked, found, start_time);
         if let Some(original_start) = start_time {
@@ -126,183 +141,149 @@ async fn main() -> Result<()> {
         stats.reset();
     }
 
-    // Initialize bloom filter (prevent duplicate checks)
-    let bloom_filter = BloomFilterManager::new(
+    let bloom_filter = Arc::new(BloomFilterManager::new(
         config.optimization.bloom_capacity,
         0.001
-    );
-    
-    // Track bloom filter failures to detect if it's consistently failing
-    let bloom_failure_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    
-    // Clear bloom filter if starting fresh (not resuming)
+    ));
+
     if start_index == 0 {
         bloom_filter.clear();
     }
 
-    // Ensure dictionaries are downloaded
     info!("Ensuring dictionaries are available...");
     DictionaryLoader::ensure_dictionaries(&config).await?;
 
-    // Load dictionaries
     info!("Loading dictionaries...");
     let dictionaries = DictionaryLoader::load_all(&config)?;
     info!("Loaded {} dictionary entries", dictionaries.total_entries());
 
-    // Generate attack patterns using lazy iterator (memory-efficient)
     info!("Generating attack patterns (lazy iterator mode)...");
     let patterns_iter = PatternGenerator::generate_iter(&dictionaries, &config);
-    info!("Pattern iterator ready (patterns generated on-demand to save memory)");
+    info!("Pattern iterator ready");
 
-    // Initialize components
-    let wallet_generator = WalletGenerator::new(&config)?;
-    let balance_checker = BalanceChecker::new(&config).await?;
+    // Channel setup
+    let (job_tx, job_rx) = mpsc::channel::<PatternJob>(1000);
+    let (retry_tx, retry_rx) = mpsc::channel::<PatternJob>(500);
+    let (result_tx, result_rx) = mpsc::channel::<ProcessResult>(1000);
 
-    // Main attack loop
-    info!("Starting attack loop...");
-    info!("Target: {} patterns", max_patterns);
+    let job_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+    let retry_rx = Arc::new(tokio::sync::Mutex::new(retry_rx));
 
-    let progress_bar = indicatif::ProgressBar::new(max_patterns as u64);
-    progress_bar.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-            .unwrap()
-            .progress_chars("#>-")
-    );
-
-    // Setup CTRL+C handler for graceful shutdown
+    // Setup CTRL+C handler
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let shutdown_tx_clone = shutdown_tx.clone();
-    
+
     tokio::spawn(async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
             warn!("Failed to listen for Ctrl+C: {}", e);
             return;
         }
-        info!("\n🛑 Received Ctrl+C, saving checkpoint and shutting down gracefully...");
+        info!("\n🛑 Received Ctrl+C, shutting down gracefully...");
         shutdown_tx_clone.send(()).await.ok();
     });
 
-    // Use iterator with enumerate to track index
-    // Skip patterns up to start_index (for checkpoint resume)
-    // CRITICAL: enumerate() must be AFTER skip() to get correct absolute index
-    for (relative_idx, pattern) in patterns_iter.skip(start_index).enumerate() {
-        // Calculate absolute index (for checkpoint and progress tracking)
-        let i = start_index + relative_idx;
-        
-        // Check for shutdown signal (non-blocking)
-        if shutdown_rx.try_recv().is_ok() {
-            info!("Shutdown signal received, saving checkpoint...");
-            checkpoint_manager.save(i, stats.checked(), stats.found(), Some(stats.start_time()))?;
-            info!("✅ Checkpoint saved, exiting gracefully...");
-            return Ok(());
-        }
+    // Spawn worker tasks
+    info!("Starting {} worker threads...", args.workers);
+    let mut worker_handles = vec![];
 
-        if i >= max_patterns {
-            break;
-        }
+    for worker_id in 0..args.workers {
+        let job_rx = job_rx.clone();
+        let retry_rx = retry_rx.clone();
+        let result_tx = result_tx.clone();
+        let config = config.clone();
+        let bloom_filter = bloom_filter.clone();
+        let stats = stats.clone();
 
-        // Check bloom filter (skip duplicates)
-        // Note: If bloom filter is disabled due to overflow, contains() may not work correctly
-        // but we continue processing to avoid stopping the entire attack
-        if bloom_filter.contains(&pattern) {
-            continue;
-        }
-        
-        // Proactive bloom filter management: clear at 95% capacity to prevent overflow
-        // This prevents the bloom filter from reaching 100% and causing add() failures
-        // NOTE: Clearing will cause previously checked patterns to be re-checked,
-        // but this is acceptable to prevent overflow and crash
-        if bloom_filter.is_near_capacity() {
-            warn!("Bloom filter 95% full ({} / {}), clearing to prevent overflow...", 
-                  bloom_filter.len(), bloom_filter.capacity());
-            bloom_filter.clear();
-            bloom_failure_count.store(0, std::sync::atomic::Ordering::Relaxed); // Reset counter after successful clear
-        }
+        let handle = tokio::spawn(async move {
+            worker_task(
+                worker_id,
+                job_rx,
+                retry_rx,
+                result_tx,
+                config,
+                bloom_filter,
+                stats,
+            ).await
+        });
 
-        // Generate wallet from pattern
-        let wallets = match wallet_generator.generate(&pattern) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!("Failed to generate wallet: {}", e);
-                continue;
-            }
-        };
-
-        // Check balances with error handling
-        // CRITICAL: Only add to bloom filter AFTER successful balance check
-        // If API fails, we don't add to bloom filter so pattern can be retried later
-        let results = match balance_checker.check(&wallets).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Balance check failed for pattern {}: {}. NOT adding to bloom filter - will retry later", pattern, e);
-                // Continue processing, don't crash
-                // CRITICAL: Don't add to bloom filter on API failure - allows retry later
-                // Don't increment checked count if balance check completely failed
-                continue;
-            }
-        };
-
-        // ONLY add to bloom filter after successful balance check
-        // This ensures we don't mark patterns as "checked" when API fails
-        // 
-        // NOTE: BloomFilterManager.add() already performs proactive clearing at 95% capacity internally.
-        // If add() still fails, it means the pattern is too large or there's an internal issue.
-        // In this case, we use graceful degradation: continue processing without duplicate check.
-        // Clearing and retrying here would be redundant and would cause previously checked
-        // patterns to be lost, leading to duplicate API calls.
-        if let Err(e) = bloom_filter.add(&pattern) {
-            // Graceful degradation: continue without duplicate check for this pattern
-            // This is acceptable - we'll process the pattern anyway, just without duplicate detection
-            let failure_count = bloom_failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            warn!("Bloom filter add failed: {}. Continuing without duplicate check for this pattern. (Total failures: {})", e, failure_count);
-            
-            // Warn if bloom filter is consistently failing (might indicate a systemic issue)
-            if failure_count % 100 == 0 {
-                warn!("Bloom filter has failed {} times. Consider increasing bloom_capacity in config or investigating pattern sizes.", failure_count);
-            }
-            // Don't panic - continue processing the pattern
-        } else {
-            // Success - reset failure counter on successful add
-            bloom_failure_count.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Update statistics
-        stats.increment_checked();
-
-        // Found a wallet with balance > 0!
-        if !results.is_empty() {
-            stats.increment_found();
-            
-            // Log with colored output
-            log_wallet_found(&pattern, &wallets, &results)?;
-
-            // Save hit to file with all details
-            save_hit(&pattern, &wallets, &results).await?;
-        }
-
-        // Update progress (less frequent checkpoint to reduce disk I/O)
-        if i % 100 == 0 {
-            progress_bar.set_position(i as u64);
-            let rate = stats.get_rate();
-            info!("Progress: {} | Rate: {:.2} w/s | Found: {}", 
-                i, rate, stats.found());
-        }
-
-        // Save checkpoint less frequently (every 5000 patterns or on hit)
-        if i % 5000 == 0 || !results.is_empty() {
-            checkpoint_manager.save(i, stats.checked(), stats.found(), Some(stats.start_time()))?;
-        }
-
-        // Rate limiting
-        if i % 50 == 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                config.rate_limiting.batch_cooldown_ms
-            )).await;
-        }
+        worker_handles.push(handle);
     }
 
-    progress_bar.finish_with_message("Attack completed");
+    // Producer task
+    let producer_handle = tokio::spawn({
+        let job_tx = job_tx.clone();
+        let bloom_filter = bloom_filter.clone();
+        let shutdown_tx = shutdown_tx.clone();
+
+        async move {
+            let mut sent_count = 0;
+
+            for (relative_idx, pattern) in patterns_iter.skip(start_index).enumerate() {
+                let i = start_index + relative_idx;
+
+                if i >= max_patterns {
+                    break;
+                }
+
+                // Check bloom filter
+                if bloom_filter.contains(&pattern) {
+                    continue;
+                }
+
+                let job = PatternJob {
+                    pattern,
+                    index: i,
+                    retry_count: 0,
+                };
+
+                if job_tx.send(job).await.is_err() {
+                    error!("Job channel closed, stopping producer");
+                    break;
+                }
+
+                sent_count += 1;
+            }
+
+            info!("Producer finished: {} patterns sent", sent_count);
+            drop(job_tx); // Signal completion
+            shutdown_tx.send(()).await.ok();
+        }
+    });
+
+    // Result aggregator task
+    let aggregator_handle = tokio::spawn({
+        let retry_tx = retry_tx.clone();
+        let checkpoint_manager = checkpoint_manager.clone();
+        let stats = stats.clone();
+
+        async move {
+            result_aggregator(
+                result_rx,
+                retry_tx,
+                checkpoint_manager,
+                stats,
+                max_patterns,
+            ).await
+        }
+    });
+
+    // Wait for shutdown signal
+    shutdown_rx.recv().await;
+    info!("Shutdown signal received, cleaning up...");
+
+    // Drop channels to signal workers
+    drop(job_tx);
+    drop(retry_tx);
+    drop(result_tx);
+
+    // Wait for all workers
+    for handle in worker_handles {
+        let _ = handle.await;
+    }
+
+    // Wait for producer and aggregator
+    let _ = producer_handle.await;
+    let _ = aggregator_handle.await;
 
     // Final statistics
     let final_stats = serde_json::json!({
@@ -325,16 +306,12 @@ async fn main() -> Result<()> {
     info!("Bloom filter entries: ~{}", bloom_filter.len());
     info!("═══════════════════════════════════════════════");
 
-    // Save final statistics to file
     std::fs::write(
         "output/stats.json",
         serde_json::to_string_pretty(&final_stats)?
     )?;
     info!("Statistics saved to output/stats.json");
 
-    // Save final checkpoint
-    // Note: patterns_iter doesn't have a known length (lazy evaluation)
-    // We use max_patterns as the final index since we iterate up to that limit
     checkpoint_manager.save(
         max_patterns,
         stats.checked(),
@@ -343,6 +320,194 @@ async fn main() -> Result<()> {
     )?;
 
     Ok(())
+}
+
+async fn worker_task(
+    worker_id: usize,
+    job_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PatternJob>>>,
+    retry_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PatternJob>>>,
+    result_tx: mpsc::Sender<ProcessResult>,
+    config: Config,
+    bloom_filter: Arc<BloomFilterManager>,
+    stats: Arc<Statistics>,
+) {
+    let wallet_generator = match WalletGenerator::new(&config) {
+        Ok(gen) => gen,
+        Err(e) => {
+            error!("Worker {}: Failed to create wallet generator: {}", worker_id, e);
+            return;
+        }
+    };
+
+    let balance_checker = match BalanceChecker::new(&config).await {
+        Ok(checker) => checker,
+        Err(e) => {
+            error!("Worker {}: Failed to create balance checker: {}", worker_id, e);
+            return;
+        }
+    };
+
+    loop {
+        // Priority 1: Process retry queue first
+        let job = {
+            let mut retry = retry_rx.lock().await;
+            if let Ok(job) = retry.try_recv() {
+                Some(job)
+            } else {
+                drop(retry);
+                // Priority 2: Process normal queue
+                let mut jobs = job_rx.lock().await;
+                jobs.recv().await
+            }
+        };
+
+        let job = match job {
+            Some(j) => j,
+            None => {
+                info!("Worker {}: No more jobs, exiting", worker_id);
+                break;
+            }
+        };
+
+        // Generate wallet
+        let wallets = match wallet_generator.generate(&job.pattern) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("Worker {}: Failed to generate wallet: {}", worker_id, e);
+                let _ = result_tx.send(ProcessResult::Failed {
+                    index: job.index,
+                    error: e.to_string(),
+                }).await;
+                continue;
+            }
+        };
+
+        // Check balances
+        let results = match balance_checker.check(&wallets).await {
+            Ok(r) => r,
+            Err(e) => {
+                let error_str = e.to_string();
+
+                // Detect rate limit
+                if error_str.contains("429") || error_str.contains("Rate limit") {
+                    warn!("Worker {}: Rate limited at index {}, requeueing...", worker_id, job.index);
+
+                    if job.retry_count < 5 {
+                        let mut retry_job = job.clone();
+                        retry_job.retry_count += 1;
+
+                        let _ = result_tx.send(ProcessResult::RateLimited {
+                            job: retry_job,
+                        }).await;
+
+                        // Backoff
+                        tokio::time::sleep(tokio::time::Duration::from_secs(
+                            2u64.pow(job.retry_count)
+                        )).await;
+                    } else {
+                        warn!("Worker {}: Max retries exceeded for index {}", worker_id, job.index);
+                        let _ = result_tx.send(ProcessResult::Failed {
+                            index: job.index,
+                            error: format!("Max retries exceeded: {}", error_str),
+                        }).await;
+                    }
+                } else {
+                    // Non-rate-limit error
+                    warn!("Worker {}: Balance check failed: {}", worker_id, e);
+                    let _ = result_tx.send(ProcessResult::Failed {
+                        index: job.index,
+                        error: error_str,
+                    }).await;
+                }
+                continue;
+            }
+        };
+
+        // Success - add to bloom filter
+        if let Err(e) = bloom_filter.add(&job.pattern) {
+            warn!("Worker {}: Bloom filter add failed: {}", worker_id, e);
+        }
+
+        stats.increment_checked();
+
+        let found = !results.is_empty();
+        if found {
+            stats.increment_found();
+
+            if let Err(e) = log_wallet_found(&job.pattern, &wallets, &results) {
+                error!("Worker {}: Failed to log wallet: {}", worker_id, e);
+            }
+
+            if let Err(e) = save_hit(&job.pattern, &wallets, &results).await {
+                error!("Worker {}: Failed to save hit: {}", worker_id, e);
+            }
+        }
+
+        let _ = result_tx.send(ProcessResult::Success {
+            index: job.index,
+            found,
+        }).await;
+    }
+}
+
+async fn result_aggregator(
+    mut result_rx: mpsc::Receiver<ProcessResult>,
+    retry_tx: mpsc::Sender<PatternJob>,
+    checkpoint_manager: Arc<CheckpointManager>,
+    stats: Arc<Statistics>,
+    max_patterns: usize,
+) {
+    let mut last_checkpoint = std::time::Instant::now();
+    let checkpoint_interval = std::time::Duration::from_secs(300); // 5 min
+    let mut last_index = 0;
+
+    while let Some(result) = result_rx.recv().await {
+        match result {
+            ProcessResult::Success { index, found } => {
+                last_index = last_index.max(index);
+
+                if index % 100 == 0 {
+                    info!("[{}] Rate: {:.2} w/s | Found: {}",
+                        index, stats.get_rate(), stats.found());
+                }
+
+                if found || last_checkpoint.elapsed() > checkpoint_interval {
+                    if let Err(e) = checkpoint_manager.save(
+                        last_index,
+                        stats.checked(),
+                        stats.found(),
+                        Some(stats.start_time())
+                    ) {
+                        error!("Failed to save checkpoint: {}", e);
+                    }
+                    last_checkpoint = std::time::Instant::now();
+                }
+            }
+
+            ProcessResult::RateLimited { job } => {
+                if let Err(e) = retry_tx.send(job).await {
+                    error!("Failed to send to retry queue: {}", e);
+                }
+            }
+
+            ProcessResult::Failed { index, error } => {
+                warn!("Pattern {} failed: {}", index, error);
+                last_index = last_index.max(index);
+            }
+        }
+    }
+
+    info!("Result aggregator finished");
+
+    // Final checkpoint
+    if let Err(e) = checkpoint_manager.save(
+        last_index,
+        stats.checked(),
+        stats.found(),
+        Some(stats.start_time())
+    ) {
+        error!("Failed to save final checkpoint: {}", e);
+    }
 }
 
 fn display_banner() {
@@ -368,7 +533,7 @@ fn init_logging(verbose: bool) -> Result<()> {
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true)
-        .with_ansi(true) // Enable ANSI color codes
+        .with_ansi(true)
         .init();
 
     Ok(())
@@ -397,13 +562,11 @@ async fn save_hit(
         "balances": results,
     });
 
-    // Use NDJSON format (newline-delimited JSON) for better parsing
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open("output/found_wallets.ndjson")?;
 
-    // Compact JSON (not pretty) for NDJSON format
     writeln!(file, "{}", serde_json::to_string(&hit)?)?;
 
     Ok(())
