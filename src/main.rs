@@ -163,9 +163,9 @@ async fn main() -> Result<()> {
 
     // Channel setup
     let (job_tx, job_rx) = mpsc::channel::<PatternJob>(1000);
-    // Retry queue is unbounded to avoid deadlock/backpressure during rate-limit storms.
-    // Bounded retry can cause `result_aggregator` to block on `.send().await`, stalling progress.
-    let (retry_tx, retry_rx) = mpsc::unbounded_channel::<PatternJob>();
+    // Retry queue is bounded to prevent unbounded memory growth during rate-limit storms.
+    // Workers prioritize retry work, so this naturally applies backpressure until retry drains.
+    let (retry_tx, retry_rx) = mpsc::channel::<PatternJob>(10_000);
     let (result_tx, result_rx) = mpsc::channel::<ProcessResult>(1000);
 
     let job_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
@@ -342,7 +342,7 @@ async fn main() -> Result<()> {
 async fn worker_task(
     worker_id: usize,
     job_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PatternJob>>>,
-    retry_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<PatternJob>>>,
+    retry_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PatternJob>>>,
     result_tx: mpsc::Sender<ProcessResult>,
     config: Config,
     bloom_filter: Arc<BloomFilterManager>,
@@ -388,7 +388,7 @@ async fn worker_task(
         };
 
         // Generate wallet
-        let wallets = match wallet_generator.generate(&job.pattern) {
+        let wallets_list = match wallet_generator.generate(&job.pattern) {
             Ok(w) => w,
             Err(e) => {
                 warn!("Worker {}: Failed to generate wallet: {}", worker_id, e);
@@ -400,46 +400,63 @@ async fn worker_task(
             }
         };
 
-        // Check balances
-        let results = match balance_checker.check(&wallets).await {
-            Ok(r) => r,
-            Err(e) => {
-                let error_str = e.to_string();
+        let mut found_any = false;
 
-                // Detect rate limit
-                if error_str.contains("429") || error_str.contains("Rate limit") {
-                    warn!("Worker {}: Rate limited at index {}, requeueing...", worker_id, job.index);
+        for wallets in &wallets_list {
+            // Check balances
+            let results = match balance_checker.check(wallets).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let error_str = e.to_string();
 
-                    if job.retry_count < 5 {
-                        let mut retry_job = job.clone();
-                        retry_job.retry_count += 1;
+                    // Detect rate limit
+                    if error_str.contains("429") || error_str.contains("Rate limit") {
+                        warn!("Worker {}: Rate limited at index {}, requeueing...", worker_id, job.index);
 
-                        let _ = result_tx.send(ProcessResult::RateLimited {
-                            job: retry_job,
-                        }).await;
+                        if job.retry_count < 5 {
+                            let mut retry_job = job.clone();
+                            retry_job.retry_count += 1;
 
-                        // Backoff
-                        tokio::time::sleep(tokio::time::Duration::from_secs(
-                            2u64.pow(job.retry_count)
-                        )).await;
+                            let _ = result_tx.send(ProcessResult::RateLimited {
+                                job: retry_job,
+                            }).await;
+
+                            // Backoff
+                            tokio::time::sleep(tokio::time::Duration::from_secs(
+                                2u64.pow(job.retry_count)
+                            )).await;
+                        } else {
+                            warn!("Worker {}: Max retries exceeded for index {}", worker_id, job.index);
+                            let _ = result_tx.send(ProcessResult::Failed {
+                                index: job.index,
+                                error: format!("Max retries exceeded: {}", error_str),
+                            }).await;
+                        }
                     } else {
-                        warn!("Worker {}: Max retries exceeded for index {}", worker_id, job.index);
+                        // Non-rate-limit error
+                        warn!("Worker {}: Balance check failed: {}", worker_id, e);
                         let _ = result_tx.send(ProcessResult::Failed {
                             index: job.index,
-                            error: format!("Max retries exceeded: {}", error_str),
+                            error: error_str,
                         }).await;
                     }
-                } else {
-                    // Non-rate-limit error
-                    warn!("Worker {}: Balance check failed: {}", worker_id, e);
-                    let _ = result_tx.send(ProcessResult::Failed {
-                        index: job.index,
-                        error: error_str,
-                    }).await;
+                    continue;
                 }
-                continue;
+            };
+
+            let found = !results.is_empty();
+            if found {
+                found_any = true;
+
+                if let Err(e) = log_wallet_found(&job.pattern, wallets, &results) {
+                    error!("Worker {}: Failed to log wallet: {}", worker_id, e);
+                }
+
+                if let Err(e) = save_hit(&job.pattern, wallets, &results).await {
+                    error!("Worker {}: Failed to save hit: {}", worker_id, e);
+                }
             }
-        };
+        }
 
         // Success - add to bloom filter
         if let Err(e) = bloom_filter.add(&job.pattern) {
@@ -448,29 +465,20 @@ async fn worker_task(
 
         stats.increment_checked();
 
-        let found = !results.is_empty();
-        if found {
+        if found_any {
             stats.increment_found();
-
-            if let Err(e) = log_wallet_found(&job.pattern, &wallets, &results) {
-                error!("Worker {}: Failed to log wallet: {}", worker_id, e);
-            }
-
-            if let Err(e) = save_hit(&job.pattern, &wallets, &results).await {
-                error!("Worker {}: Failed to save hit: {}", worker_id, e);
-            }
         }
 
         let _ = result_tx.send(ProcessResult::Success {
             index: job.index,
-            found,
+            found: found_any,
         }).await;
     }
 }
 
 async fn result_aggregator(
     mut result_rx: mpsc::Receiver<ProcessResult>,
-    retry_tx: mpsc::UnboundedSender<PatternJob>,
+    retry_tx: mpsc::Sender<PatternJob>,
     checkpoint_manager: Arc<CheckpointManager>,
     stats: Arc<Statistics>,
     max_patterns: usize,
@@ -513,7 +521,7 @@ async fn result_aggregator(
             }
 
             ProcessResult::RateLimited { job } => {
-                if let Err(e) = retry_tx.send(job) {
+                if let Err(e) = retry_tx.send(job).await {
                     error!("Failed to send to retry queue: {}", e);
                 }
             }
@@ -586,6 +594,7 @@ async fn save_hit(
             "btc": wallets.btc,
             "eth": wallets.eth,
             "sol": wallets.sol,
+            "bip39_passphrase": wallets.bip39_passphrase,
         },
         "balances": results,
     });

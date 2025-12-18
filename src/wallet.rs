@@ -24,6 +24,8 @@ pub struct WalletAddresses {
     pub btc: Vec<String>,
     pub eth: String,
     pub sol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bip39_passphrase: Option<String>,
 }
 
 pub struct WalletGenerator {
@@ -39,18 +41,28 @@ impl WalletGenerator {
         })
     }
 
-    pub fn generate(&self, pattern: &AttackPattern) -> Result<WalletAddresses> {
-        let seed = self.pattern_to_seed(pattern)?;
+    pub fn generate(&self, pattern: &AttackPattern) -> Result<Vec<WalletAddresses>> {
+        let candidates = self.pattern_to_seed_candidates(pattern)?;
+        let mut out = Vec::with_capacity(candidates.len());
 
-        let btc = self.generate_btc_addresses(&seed)?;
-        let eth = self.generate_eth_address(&seed)?;
-        let sol = if self.config.chains.enabled.contains(&"SOL".to_string()) {
-            Some(self.generate_sol_address(&seed)?)
-        } else {
-            None
-        };
+        for (seed, passphrase) in candidates {
+            let btc = self.generate_btc_addresses(&seed)?;
+            let eth = self.generate_eth_address(&seed)?;
+            let sol = if self.config.chains.enabled.contains(&"SOL".to_string()) {
+                Some(self.generate_sol_address(&seed)?)
+            } else {
+                None
+            };
 
-        Ok(WalletAddresses { btc, eth, sol })
+            out.push(WalletAddresses {
+                btc,
+                eth,
+                sol,
+                bip39_passphrase: passphrase,
+            });
+        }
+
+        Ok(out)
     }
 
     fn pattern_to_seed(&self, pattern: &AttackPattern) -> Result<[u8; 64]> {
@@ -64,16 +76,27 @@ impl WalletGenerator {
             }
 
             AttackPattern::SingleWord { word } => {
-                self.pbkdf2_seed(word)
+                // If the "single word" is actually a full mnemonic phrase (e.g. 12 words),
+                // prefer BIP39 parsing + checksum validation first.
+                if let Ok(mnemonic) = Mnemonic::parse_in_normalized(Language::English, word) {
+                    Ok(mnemonic.to_seed(""))
+                } else {
+                    self.pbkdf2_seed(word)
+                }
             }
 
             AttackPattern::Bip39Repeat { word, count } => {
-                let words: Vec<&str> = std::iter::repeat_n(word.as_str(), *count).collect();
-                let repeated = words.join(" ");
-
-                if let Ok(mnemonic) = Mnemonic::parse_in_normalized(Language::English, &repeated) {
+                // NOTE: repeating the same word N times will almost always fail BIP39 checksum.
+                // To generate a *valid* weak BIP39 mnemonic, we repeat the word for N-1 positions
+                // and brute-force the last word over the official English word list (2048) until
+                // `Mnemonic::parse_in_normalized` accepts it.
+                if let Some(phrase) = Self::make_valid_bip39_repeat_phrase(word, *count) {
+                    let mnemonic = Mnemonic::parse_in_normalized(Language::English, &phrase)
+                        .context("Generated BIP39 repeat phrase should be valid")?;
                     Ok(mnemonic.to_seed(""))
                 } else {
+                    // Fallback: treat as generic passphrase if no valid checksum word exists.
+                    let repeated = std::iter::repeat_n(word.as_str(), *count).collect::<Vec<_>>().join(" ");
                     self.pbkdf2_seed(&repeated)
                 }
             }
@@ -89,6 +112,82 @@ impl WalletGenerator {
                 }
             }
         }
+    }
+
+    fn pattern_to_seed_candidates(&self, pattern: &AttackPattern) -> Result<Vec<([u8; 64], Option<String>)>> {
+        // Default: single attempt (non-mnemonic / passphrase not applicable)
+        let single = |seed: [u8; 64]| -> Vec<([u8; 64], Option<String>)> { vec![(seed, None)] };
+
+        match pattern {
+            AttackPattern::SingleWord { word } => {
+                if let Ok(mnemonic) = Mnemonic::parse_in_normalized(Language::English, word) {
+                    return Ok(self.seeds_for_passphrases(&mnemonic));
+                }
+                Ok(single(self.pbkdf2_seed(word)?))
+            }
+            AttackPattern::Bip39Repeat { word, count } => {
+                if let Some(phrase) = Self::make_valid_bip39_repeat_phrase(word, *count) {
+                    let mnemonic = Mnemonic::parse_in_normalized(Language::English, &phrase)
+                        .context("Generated BIP39 repeat phrase should be valid")?;
+                    Ok(self.seeds_for_passphrases(&mnemonic))
+                } else {
+                    Ok(single(self.pattern_to_seed(pattern)?))
+                }
+            }
+            _ => {
+                // For other patterns, try mnemonic parsing; if it parses, try passphrases.
+                let mnemonic_str = pattern.to_mnemonic(&crate::dictionary::Dictionaries::default())?;
+                if let Ok(mnemonic) = Mnemonic::parse_in_normalized(Language::English, &mnemonic_str) {
+                    Ok(self.seeds_for_passphrases(&mnemonic))
+                } else {
+                    Ok(single(self.pbkdf2_seed(&mnemonic_str)?))
+                }
+            }
+        }
+    }
+
+    fn seeds_for_passphrases(&self, mnemonic: &Mnemonic) -> Vec<([u8; 64], Option<String>)> {
+        let mut passphrases = self.config.optimization.bip39_passphrases.clone();
+        if passphrases.is_empty() {
+            passphrases.push("".to_string());
+        }
+
+        // Keep stable order and avoid duplicates.
+        passphrases.sort();
+        passphrases.dedup();
+
+        passphrases
+            .into_iter()
+            .map(|p| {
+                let seed = mnemonic.to_seed(&p);
+                let pass = if p.is_empty() { None } else { Some(p) };
+                (seed, pass)
+            })
+            .collect()
+    }
+
+    fn make_valid_bip39_repeat_phrase(word: &str, count: usize) -> Option<String> {
+        if count != 12 && count != 24 {
+            return None;
+        }
+
+        // First N-1 words are the repeated word; last is brute-forced to satisfy checksum.
+        let prefix = std::iter::repeat_n(word, count.saturating_sub(1))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for &candidate in Language::English.word_list().iter() {
+            let phrase = if prefix.is_empty() {
+                candidate.to_string()
+            } else {
+                format!("{} {}", prefix, candidate)
+            };
+            if Mnemonic::parse_in_normalized(Language::English, &phrase).is_ok() {
+                return Some(phrase);
+            }
+        }
+
+        None
     }
 
     fn pbkdf2_seed(&self, passphrase: &str) -> Result<[u8; 64]> {
@@ -138,33 +237,37 @@ impl WalletGenerator {
         Ok(addresses)
     }
 
-    /// Strict BTC derivation path validation:
-    /// Only accept m/{44,49,84}'/0'/0'/0/0
+    /// BTC derivation path classification (safe but not overly strict):
+    /// - Accept BIP44/49/84 with coin_type 0' for Bitcoin mainnet.
+    /// - Do NOT restrict account/change/index (wallets commonly use non-zero values).
+    /// - Also accept a common non-standard legacy path: m/0'/0/0
     fn btc_address_type_for_path(path: &DerivationPath) -> Result<BtcAddressType> {
         use bitcoin::util::bip32::ChildNumber;
 
         let comps: Vec<ChildNumber> = path.into_iter().cloned().collect();
-        if comps.len() != 5 {
-            bail!("BTC derivation path must have exactly 5 components (m/purpose'/coin_type'/account'/change/index)");
+        if comps.is_empty() {
+            bail!("BTC derivation path must not be empty");
+        }
+
+        // Non-standard legacy: m/0'/0/0
+        if comps.len() == 3
+            && comps[0] == ChildNumber::from_hardened_idx(0)?
+            && comps[1] == ChildNumber::from_normal_idx(0)?
+            && comps[2] == ChildNumber::from_normal_idx(0)?
+        {
+            return Ok(BtcAddressType::LegacyP2pkh);
+        }
+
+        // BIP44-like: m/purpose'/coin_type'/...
+        if comps.len() < 2 {
+            bail!("BTC derivation path too short; expected at least m/purpose'/coin_type'/...");
         }
 
         let purpose = comps[0];
         let coin_type = comps[1];
-        let account = comps[2];
-        let change = comps[3];
-        let index = comps[4];
 
         if coin_type != ChildNumber::from_hardened_idx(0)? {
             bail!("BTC derivation path coin_type must be 0'");
-        }
-        if account != ChildNumber::from_hardened_idx(0)? {
-            bail!("BTC derivation path account must be 0'");
-        }
-        if change != ChildNumber::from_normal_idx(0)? {
-            bail!("BTC derivation path change must be 0");
-        }
-        if index != ChildNumber::from_normal_idx(0)? {
-            bail!("BTC derivation path index must be 0");
         }
 
         if purpose == ChildNumber::from_hardened_idx(44)? {
@@ -174,7 +277,7 @@ impl WalletGenerator {
         } else if purpose == ChildNumber::from_hardened_idx(84)? {
             Ok(BtcAddressType::NativeSegwitP2wpkh)
         } else {
-            bail!("BTC derivation path purpose must be 44', 49', or 84'");
+            bail!("BTC derivation path purpose must be 44', 49', or 84' (or non-standard m/0'/0/0)");
         }
     }
 
@@ -291,6 +394,7 @@ impl WalletGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bip39::Mnemonic;
 
     #[test]
     fn test_btc_address_generation() {
@@ -307,15 +411,16 @@ mod tests {
         };
 
         let wallets = generator.generate(&pattern).unwrap();
+        let wallets0 = wallets.first().unwrap();
 
-        assert_eq!(wallets.btc.len(), 3);
-        assert!(wallets.btc[0].starts_with("1"));
-        assert!(wallets.btc[1].starts_with("3"));
-        assert!(wallets.btc[2].starts_with("bc1"));
+        assert_eq!(wallets0.btc.len(), 3);
+        assert!(wallets0.btc[0].starts_with("1"));
+        assert!(wallets0.btc[1].starts_with("3"));
+        assert!(wallets0.btc[2].starts_with("bc1"));
     }
 
     #[test]
-    fn test_btc_derivation_path_rejects_nonzero_account() {
+    fn test_btc_derivation_path_allows_nonzero_account() {
         let mut config = Config::default();
         config.chains.btc_paths = vec![
             "m/44'/0'/1'/0/0".to_string(),
@@ -326,12 +431,14 @@ mod tests {
             word: "test".to_string(),
         };
 
-        let err = generator.generate(&pattern).unwrap_err().to_string();
-        assert!(err.contains("account must be 0'"), "got error: {}", err);
+        let wallets = generator.generate(&pattern).unwrap();
+        let w = wallets.first().unwrap();
+        assert_eq!(w.btc.len(), 1);
+        assert!(w.btc[0].starts_with('1'));
     }
 
     #[test]
-    fn test_btc_derivation_path_rejects_nonzero_change_or_index() {
+    fn test_btc_derivation_path_allows_nonzero_change_or_index() {
         let mut config = Config::default();
         config.chains.btc_paths = vec![
             "m/84'/0'/0'/1/0".to_string(),
@@ -343,12 +450,29 @@ mod tests {
             word: "test".to_string(),
         };
 
-        let err = generator.generate(&pattern).unwrap_err().to_string();
-        assert!(
-            err.contains("change must be 0") || err.contains("index must be 0"),
-            "got error: {}",
-            err
-        );
+        let wallets = generator.generate(&pattern).unwrap();
+        let w = wallets.first().unwrap();
+        assert_eq!(w.btc.len(), 2);
+        assert!(w.btc[0].starts_with("bc1"));
+        assert!(w.btc[1].starts_with("bc1"));
+    }
+
+    #[test]
+    fn test_btc_derivation_path_allows_nonstandard_m0h_0_0() {
+        let mut config = Config::default();
+        config.chains.btc_paths = vec![
+            "m/0'/0/0".to_string(),
+        ];
+        let generator = WalletGenerator::new(&config).unwrap();
+
+        let pattern = crate::pattern::AttackPattern::SingleWord {
+            word: "test".to_string(),
+        };
+
+        let wallets = generator.generate(&pattern).unwrap();
+        let w = wallets.first().unwrap();
+        assert_eq!(w.btc.len(), 1);
+        assert!(w.btc[0].starts_with('1'));
     }
 
     #[test]
@@ -361,15 +485,42 @@ mod tests {
         };
 
         let wallets = generator.generate(&pattern).unwrap();
+        let wallets0 = wallets.first().unwrap();
 
         // Should have mixed case (EIP-55 checksum)
-        assert!(wallets.eth.starts_with("0x"));
-        assert_eq!(wallets.eth.len(), 42);
+        assert!(wallets0.eth.starts_with("0x"));
+        assert_eq!(wallets0.eth.len(), 42);
 
         // Should have at least one uppercase letter (if checksum applies)
-        let has_uppercase = wallets.eth[2..].chars().any(|c| c.is_uppercase());
-        let has_lowercase = wallets.eth[2..].chars().any(|c| c.is_lowercase());
+        let has_uppercase = wallets0.eth[2..].chars().any(|c| c.is_uppercase());
+        let has_lowercase = wallets0.eth[2..].chars().any(|c| c.is_lowercase());
         assert!(has_uppercase || has_lowercase);
+    }
+
+    #[test]
+    fn test_bip39_repeat_produces_valid_checksum_phrase() {
+        let phrase = WalletGenerator::make_valid_bip39_repeat_phrase("abandon", 12)
+            .expect("should find a valid checksum word for 12-word repeat");
+        assert!(Mnemonic::parse_in_normalized(Language::English, &phrase).is_ok());
+    }
+
+    #[test]
+    fn test_singleword_prefers_bip39_when_phrase_is_valid() {
+        let config = Config::default();
+        let generator = WalletGenerator::new(&config).unwrap();
+
+        // Valid BIP39 example (checksum-correct)
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        let pattern = crate::pattern::AttackPattern::SingleWord {
+            word: phrase.to_string(),
+        };
+
+        let seed_from_singleword = generator.pattern_to_seed(&pattern).unwrap();
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase).unwrap();
+        let seed_from_bip39 = mnemonic.to_seed("");
+
+        assert_eq!(seed_from_singleword, seed_from_bip39);
     }
 
     #[test]
@@ -383,8 +534,10 @@ mod tests {
 
         let wallets1 = generator.generate(&pattern).unwrap();
         let wallets2 = generator.generate(&pattern).unwrap();
+        let w1 = wallets1.first().unwrap();
+        let w2 = wallets2.first().unwrap();
 
-        assert_eq!(wallets1.btc, wallets2.btc);
-        assert_eq!(wallets1.eth, wallets2.eth);
+        assert_eq!(w1.btc, w2.btc);
+        assert_eq!(w1.eth, w2.eth);
     }
 }

@@ -7,6 +7,7 @@ use anyhow::Result;
 pub struct BloomFilterManager {
     active: parking_lot::RwLock<InternalBloom>,
     previous: parking_lot::RwLock<Option<InternalBloom>>,
+    add_lock: parking_lot::Mutex<()>,
     active_count: AtomicU64,
     previous_count: AtomicU64,
     capacity: usize,
@@ -23,6 +24,7 @@ impl BloomFilterManager {
         Self {
             active: parking_lot::RwLock::new(filter),
             previous: parking_lot::RwLock::new(None),
+            add_lock: parking_lot::Mutex::new(()),
             active_count: AtomicU64::new(0),
             previous_count: AtomicU64::new(0),
             capacity,
@@ -45,32 +47,33 @@ impl BloomFilterManager {
     /// Add pattern to bloom filter (with atomic capacity check)
     /// FIXED: Atomic check-and-add to prevent race conditions
     pub fn add<T: Hash>(&self, item: &T) -> Result<()> {
+        // Serialize rotate + count + insert to avoid races between fetch_add/insert and rotation.
+        let _guard = self.add_lock.lock();
+
         // If active filter is near capacity, rotate it to "previous" instead of clearing.
         // This avoids losing duplicate knowledge for already-seen patterns.
-        //
-        // Also handle rare races where multiple threads increment concurrently:
-        // if we detect overflow, rotate and retry instead of erroring.
-        for _attempt in 0..2 {
-            self.rotate_if_needed();
+        self.rotate_if_needed();
 
-            // Try to increment atomically (active only)
-            let new_count = self.active_count.fetch_add(1, Ordering::AcqRel) + 1;
-            if new_count > self.capacity as u64 {
-                // Rollback increment and rotate, then retry once.
-                self.active_count.fetch_sub(1, Ordering::AcqRel);
-                self.rotate_force();
-                continue;
-            }
-
-            let hash = Self::hash_item(item);
-            self.active.write().insert(&hash);
-
-            // If we just pushed the counter near the threshold, rotate for subsequent inserts.
-            self.rotate_if_needed();
-            return Ok(());
+        let current = self.active_count.load(Ordering::Acquire);
+        if current >= self.capacity as u64 {
+            self.rotate_force();
         }
 
-        anyhow::bail!("Bloom filter capacity exceeded after rotation retry (capacity={})", self.capacity)
+        // Safe to increment now (serialized)
+        let new_count = self.active_count.fetch_add(1, Ordering::AcqRel) + 1;
+        if new_count > self.capacity as u64 {
+            // Should be extremely rare even with the guard, but keep it safe.
+            self.active_count.fetch_sub(1, Ordering::AcqRel);
+            self.rotate_force();
+            self.active_count.fetch_add(1, Ordering::AcqRel);
+        }
+
+        let hash = Self::hash_item(item);
+        self.active.write().insert(&hash);
+
+        // Opportunistic rotate for subsequent inserts.
+        self.rotate_if_needed();
+        Ok(())
     }
 
     fn rotate_if_needed(&self) {

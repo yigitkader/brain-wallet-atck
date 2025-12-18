@@ -340,10 +340,11 @@ impl BalanceChecker {
             result: String,
         }
 
+        let address_norm = address.to_lowercase();
         let url = format!(
             "{}/api?module=account&action=balance&address={}&tag=latest",
             self.eth_etherscan_base.trim_end_matches('/'),
-            address
+            address_norm
         );
 
         let (status, body) = self.http.get(url.clone()).await
@@ -370,10 +371,11 @@ impl BalanceChecker {
             balance: u128,
         }
 
+        let address_norm = address.to_lowercase();
         let url = format!(
             "{}/v1/eth/main/addrs/{}/balance",
             self.eth_blockcypher_base.trim_end_matches('/'),
-            address
+            address_norm
         );
         let (status, body) = self.http.get(url.clone()).await
             .context("Failed to fetch ETH balance (BlockCypher)")?;
@@ -404,10 +406,11 @@ impl BalanceChecker {
             balance: String, // can exceed u64, represented as string in wei
         }
 
+        let address_norm = address.to_lowercase();
         let url = format!(
             "{}/ethereum/dashboards/address/{}",
             self.eth_blockchair_base.trim_end_matches('/'),
-            address
+            address_norm
         );
         let (status, body) = self.http.get(url.clone()).await
             .context("Failed to fetch ETH balance (Blockchair)")?;
@@ -420,7 +423,10 @@ impl BalanceChecker {
         }
 
         let data: BlockchairResp = serde_json::from_str(&body)?;
-        let entry = data.data.get(address)
+        let entry = data
+            .data
+            .get(address)
+            .or_else(|| data.data.get(&address_norm))
             .ok_or_else(|| anyhow::anyhow!("Blockchair returned no data for address {}", address))?;
         let wei: u128 = entry.address.balance.parse()
             .context(format!("Failed to parse ETH balance from Blockchair: {}", entry.address.balance))?;
@@ -610,6 +616,7 @@ mod tests {
             btc: vec![],
             eth: "0x0000000000000000000000000000000000000000".to_string(),
             sol: None,
+            bip39_passphrase: None,
         };
 
         let res = checker.check(&wallets).await.unwrap();
@@ -653,6 +660,7 @@ mod tests {
             btc: vec![],
             eth: "0x0000000000000000000000000000000000000000".to_string(),
             sol: Some("So11111111111111111111111111111111111111112".to_string()),
+            bip39_passphrase: None,
         };
 
         let res = checker.check(&wallets).await.unwrap();

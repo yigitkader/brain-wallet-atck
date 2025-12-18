@@ -36,15 +36,17 @@ impl CheckpointManager {
     /// Save checkpoint to file (atomic write with process-safe locking)
     /// FIXED: Process-level lock + atomic write to prevent corruption
     pub fn save(&self, index: usize, checked: u64, found: u64, start_time: Option<u64>) -> Result<()> {
-        // FIXED: Acquire process-level lock first
-        let _guard = self.write_lock.lock();
+        // Preserve original start_time (read outside the process write lock to avoid nested locks).
+        // We only need the start_time field; if the file can't be read/parsed, fall back to `start_time`.
+        let preserved_start_time = self
+            .load_full()
+            .ok()
+            .flatten()
+            .and_then(|c| c.start_time)
+            .or(start_time);
 
-        // Preserve original start_time
-        let preserved_start_time = if let Some(prev_checkpoint) = self.load_full().ok().flatten() {
-            prev_checkpoint.start_time.or(start_time)
-        } else {
-            start_time
-        };
+        // Acquire process-level lock for the write section
+        let _guard = self.write_lock.lock();
 
         let checkpoint = Checkpoint {
             last_index: index,

@@ -91,6 +91,11 @@ pub struct OptimizationConfig {
     /// Mutations are expensive: 1000 words × 20 mutations = 20K patterns
     #[serde(default = "default_max_mutation_words")]
     pub max_mutation_words: usize,
+
+    /// BIP39 passphrases to try for mnemonic-derived seeds (BIP39 optional passphrase).
+    /// Include empty string to try "no passphrase".
+    #[serde(default = "default_bip39_passphrases")]
+    pub bip39_passphrases: Vec<String>,
 }
 
 fn default_batch_size() -> usize {
@@ -107,6 +112,10 @@ fn default_max_mutations_per_word() -> usize {
 
 fn default_max_mutation_words() -> usize {
     1000 // Limit number of words to mutate (1000 words × 10 mutations = 10K patterns)
+}
+
+fn default_bip39_passphrases() -> Vec<String> {
+    vec!["".to_string()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +180,23 @@ impl Config {
             anyhow::bail!("At least one BTC derivation path required");
         }
 
+        // Rate limiting sanity checks (defaults are tuned for speed, but prevent nonsense values)
+        if self.rate_limiting.min_delay_ms == 0 {
+            anyhow::bail!("rate_limiting.min_delay_ms must be >= 1");
+        }
+        if self.rate_limiting.min_delay_ms > 60_000 {
+            anyhow::bail!("rate_limiting.min_delay_ms is too high (>{}ms)", 60_000);
+        }
+        if self.rate_limiting.batch_cooldown_ms > 300_000 {
+            anyhow::bail!("rate_limiting.batch_cooldown_ms is too high (>{}ms)", 300_000);
+        }
+        if self.rate_limiting.max_retries == 0 {
+            anyhow::bail!("rate_limiting.max_retries must be >= 1");
+        }
+        if self.rate_limiting.max_retries > 100 {
+            anyhow::bail!("rate_limiting.max_retries is too high (>{})", 100);
+        }
+
         Ok(())
     }
 
@@ -203,9 +229,9 @@ btc_paths = [
 ]
 
 [rate_limiting]
-min_delay_ms = 2000
-batch_cooldown_ms = 5000
-max_retries = 3
+min_delay_ms = 100
+batch_cooldown_ms = 1000
+max_retries = 10
 
 [optimization]
 use_bloom_filter = true
@@ -215,6 +241,7 @@ batch_size = 1000
 max_password_combinations = 100
 max_mutations_per_word = 10
 max_mutation_words = 1000
+bip39_passphrases = [""]
 
 [notifications]
 webhook_url = ""
@@ -262,9 +289,9 @@ impl Default for Config {
                 ],
             },
             rate_limiting: RateLimitConfig {
-                min_delay_ms: 2000,
-                batch_cooldown_ms: 5000,
-                max_retries: 3,
+                min_delay_ms: 100,
+                batch_cooldown_ms: 1000,
+                max_retries: 10,
             },
             optimization: OptimizationConfig {
                 use_bloom_filter: true,
@@ -274,6 +301,7 @@ impl Default for Config {
                 max_password_combinations: 100,
                 max_mutations_per_word: 10,
                 max_mutation_words: 1000,
+                bip39_passphrases: vec!["".to_string()],
             },
             notifications: NotificationConfig {
                 webhook_url: None,

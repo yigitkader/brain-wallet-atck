@@ -50,6 +50,9 @@ pub fn log_wallet_found(
     info!("{}Pattern Type: {}{}", color_code, pattern.pattern_type(), reset_code);
     info!("{}Pattern: {}{}", color_code, pattern, reset_code);
     info!("{}Priority: {}{}", color_code, pattern.priority(), reset_code);
+    if let Some(pass) = &wallets.bip39_passphrase {
+        info!("{}BIP39 Passphrase: {}{}", color_code, pass, reset_code);
+    }
     info!("{}─────────────────────────────────────────────────────────{}", color_code, reset_code);
     
     if !balances.btc.is_empty() {
