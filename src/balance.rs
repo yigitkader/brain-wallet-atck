@@ -3,7 +3,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::time::sleep;
 use tracing::{debug, warn};
 use std::future::Future;
 use std::pin::Pin;
@@ -14,6 +13,52 @@ use crate::wallet::WalletAddresses;
 
 type HttpResult = Result<(u16, String)>;
 type HttpFuture = Pin<Box<dyn Future<Output = HttpResult> + Send>>;
+
+/// Process-wide shared rate limiter to avoid multiplying request rate by worker count.
+pub struct SharedRateLimiter {
+    min_delay_ms: u64,
+    batch_cooldown_ms: u64,
+    batch_every: u64,
+    state: tokio::sync::Mutex<LimiterState>,
+}
+
+struct LimiterState {
+    last_request_at: std::time::Instant,
+    count: u64,
+}
+
+impl SharedRateLimiter {
+    pub fn new(min_delay_ms: u64, batch_cooldown_ms: u64, batch_every: u64) -> Self {
+        Self {
+            min_delay_ms,
+            batch_cooldown_ms,
+            batch_every: batch_every.max(1),
+            state: tokio::sync::Mutex::new(LimiterState {
+                last_request_at: std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(min_delay_ms))
+                    .unwrap_or_else(std::time::Instant::now),
+                count: 0,
+            }),
+        }
+    }
+
+    pub async fn acquire(&self) {
+        let mut st = self.state.lock().await;
+
+        let min_delay = std::time::Duration::from_millis(self.min_delay_ms);
+        let elapsed = st.last_request_at.elapsed();
+        if elapsed < min_delay {
+            tokio::time::sleep(min_delay - elapsed).await;
+        }
+
+        st.count = st.count.saturating_add(1);
+        st.last_request_at = std::time::Instant::now();
+
+        if st.count.is_multiple_of(self.batch_every) && self.batch_cooldown_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.batch_cooldown_ms)).await;
+        }
+    }
+}
 
 trait HttpClient: Send + Sync {
     fn get(&self, url: String) -> HttpFuture;
@@ -69,6 +114,9 @@ impl BalanceResults {
 pub struct BalanceChecker {
     config: Config,
     http: Arc<dyn HttpClient>,
+    btc_limiter: Arc<SharedRateLimiter>,
+    eth_limiter: Arc<SharedRateLimiter>,
+    sol_limiter: Arc<SharedRateLimiter>,
     request_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     eth_etherscan_base: String,
     eth_blockcypher_base: String,
@@ -77,7 +125,12 @@ pub struct BalanceChecker {
 }
 
 impl BalanceChecker {
-    pub async fn new(config: &Config) -> Result<Self> {
+    pub async fn new(
+        config: &Config,
+        btc_limiter: Arc<SharedRateLimiter>,
+        eth_limiter: Arc<SharedRateLimiter>,
+        sol_limiter: Arc<SharedRateLimiter>,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent("BrainwalletAuditor/1.0")
@@ -88,6 +141,9 @@ impl BalanceChecker {
         Ok(Self {
             config: config.clone(),
             http,
+            btc_limiter,
+            eth_limiter,
+            sol_limiter,
             request_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eth_etherscan_base: "https://api.etherscan.io".to_string(),
             eth_blockcypher_base: "https://api.blockcypher.com".to_string(),
@@ -101,9 +157,13 @@ impl BalanceChecker {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn new_for_test(
         config: &Config,
         http: Arc<dyn HttpClient>,
+        btc_limiter: Arc<SharedRateLimiter>,
+        eth_limiter: Arc<SharedRateLimiter>,
+        sol_limiter: Arc<SharedRateLimiter>,
         eth_etherscan_base: String,
         eth_blockcypher_base: String,
         eth_blockchair_base: String,
@@ -112,6 +172,9 @@ impl BalanceChecker {
         Self {
             config: config.clone(),
             http,
+            btc_limiter,
+            eth_limiter,
+            sol_limiter,
             request_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eth_etherscan_base,
             eth_blockcypher_base,
@@ -191,7 +254,7 @@ impl BalanceChecker {
 
         // Check Bitcoin addresses
         for address in &wallets.btc {
-            self.rate_limit().await;
+            self.rate_limit_btc().await;
 
             let balance = match self.check_with_retry(
                 || self.check_btc_balance(address),
@@ -224,7 +287,7 @@ impl BalanceChecker {
         }
 
         // Check Ethereum address (failures logged but don't fail entire check)
-        self.rate_limit().await;
+        self.rate_limit_eth().await;
         match self.check_with_retry(|| self.check_eth_balance(&wallets.eth), max_retries).await {
             Ok(balance) => {
                 if balance > 0.0 {
@@ -263,7 +326,7 @@ impl BalanceChecker {
 
         // Check Solana address (failures logged but don't fail entire check)
         if let Some(sol_address) = &wallets.sol {
-            self.rate_limit().await;
+            self.rate_limit_sol().await;
             match self.check_with_retry(|| self.check_sol_balance(sol_address), max_retries).await {
                 Ok(balance) => {
                     if balance > 0.0 {
@@ -341,11 +404,17 @@ impl BalanceChecker {
         }
 
         let address_norm = address.to_lowercase();
-        let url = format!(
+        let mut url = format!(
             "{}/api?module=account&action=balance&address={}&tag=latest",
             self.eth_etherscan_base.trim_end_matches('/'),
             address_norm
         );
+        if let Some(key) = &self.config.api.etherscan_api_key {
+            if !key.is_empty() {
+                url.push_str("&apikey=");
+                url.push_str(key);
+            }
+        }
 
         let (status, body) = self.http.get(url.clone()).await
             .context("Failed to fetch ETH balance")?;
@@ -487,18 +556,29 @@ impl BalanceChecker {
     }
 
     /// Rate limiting implementation
-    async fn rate_limit(&self) {
-        sleep(Duration::from_millis(self.config.rate_limiting.min_delay_ms)).await;
+    async fn rate_limit_btc(&self) {
+        self.btc_limiter.acquire().await;
 
-        let count = self.request_count.fetch_add(
-            1,
-            std::sync::atomic::Ordering::SeqCst
-        );
+        let count = self
+            .request_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        if count.is_multiple_of(50) {
-            sleep(Duration::from_millis(self.config.rate_limiting.batch_cooldown_ms)).await;
-        }
+        debug!("API request #{}", count);
+    }
 
+    async fn rate_limit_eth(&self) {
+        self.eth_limiter.acquire().await;
+        let count = self
+            .request_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        debug!("API request #{}", count);
+    }
+
+    async fn rate_limit_sol(&self) {
+        self.sol_limiter.acquire().await;
+        let count = self
+            .request_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         debug!("API request #{}", count);
     }
 }
@@ -537,7 +617,8 @@ mod tests {
     #[ignore]
     async fn test_btc_balance_check() {
         let config = Config::default();
-        let checker = BalanceChecker::new(&config).await.unwrap();
+        let limiter = Arc::new(SharedRateLimiter::new(0, 0, 50));
+        let checker = BalanceChecker::new(&config, limiter.clone(), limiter.clone(), limiter.clone()).await.unwrap();
 
         let balance = checker.check_btc_balance("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").await;
         assert!(balance.is_ok());
@@ -602,10 +683,14 @@ mod tests {
         config.rate_limiting.batch_cooldown_ms = 0;
         config.rate_limiting.max_retries = 1;
 
+        let limiter = Arc::new(SharedRateLimiter::new(0, 0, 50));
         let http: Arc<dyn HttpClient> = Arc::new(http);
         let checker = BalanceChecker::new_for_test(
             &config,
             http,
+            limiter.clone(),
+            limiter.clone(),
+            limiter.clone(),
             "https://api.etherscan.io".to_string(),
             "https://api.blockcypher.com".to_string(),
             "https://api.blockchair.com".to_string(),
@@ -646,10 +731,14 @@ mod tests {
         config.rate_limiting.batch_cooldown_ms = 0;
         config.rate_limiting.max_retries = 1;
 
+        let limiter = Arc::new(SharedRateLimiter::new(0, 0, 50));
         let http: Arc<dyn HttpClient> = Arc::new(http);
         let checker = BalanceChecker::new_for_test(
             &config,
             http,
+            limiter.clone(),
+            limiter.clone(),
+            limiter.clone(),
             "http://127.0.0.1:1".to_string(),
             "http://127.0.0.1:1".to_string(),
             "http://127.0.0.1:1".to_string(),

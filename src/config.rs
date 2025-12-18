@@ -10,6 +10,7 @@ pub struct Config {
     pub chains: ChainConfig,
     pub rate_limiting: RateLimitConfig,
     pub optimization: OptimizationConfig,
+    pub api: ApiConfig,
     pub notifications: NotificationConfig,
 }
 
@@ -59,6 +60,22 @@ pub struct RateLimitConfig {
 
     /// Max retries
     pub max_retries: u32,
+
+    /// Optional per-chain overrides (ms). If None, fall back to `min_delay_ms`.
+    #[serde(default)]
+    pub btc_min_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub eth_min_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub sol_min_delay_ms: Option<u64>,
+
+    /// Optional per-chain cooldown overrides (ms). If None, fall back to `batch_cooldown_ms`.
+    #[serde(default)]
+    pub btc_batch_cooldown_ms: Option<u64>,
+    #[serde(default)]
+    pub eth_batch_cooldown_ms: Option<u64>,
+    #[serde(default)]
+    pub sol_batch_cooldown_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +149,13 @@ pub struct NotificationConfig {
     pub alert_on_find: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Etherscan API key (can be set via ETHERSCAN_API_KEY env var)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etherscan_api_key: Option<String>,
+}
+
 impl Config {
     /// Load configuration from TOML file and environment variables
     pub fn load(path: &str) -> Result<Self> {
@@ -162,6 +186,13 @@ impl Config {
         if let Ok(email) = std::env::var("EMAIL") {
             if !email.is_empty() {
                 self.notifications.email = Some(email);
+            }
+        }
+
+        // Etherscan API key from environment variable
+        if let Ok(key) = std::env::var("ETHERSCAN_API_KEY") {
+            if !key.is_empty() {
+                self.api.etherscan_api_key = Some(key);
             }
         }
     }
@@ -195,6 +226,52 @@ impl Config {
         }
         if self.rate_limiting.max_retries > 100 {
             anyhow::bail!("rate_limiting.max_retries is too high (>{})", 100);
+        }
+
+        // Per-chain overrides sanity checks (if present)
+        for (name, v) in [
+            ("btc_min_delay_ms", self.rate_limiting.btc_min_delay_ms),
+            ("eth_min_delay_ms", self.rate_limiting.eth_min_delay_ms),
+            ("sol_min_delay_ms", self.rate_limiting.sol_min_delay_ms),
+        ] {
+            if let Some(ms) = v {
+                if ms == 0 {
+                    anyhow::bail!("rate_limiting.{} must be >= 1", name);
+                }
+                if ms > 60_000 {
+                    anyhow::bail!("rate_limiting.{} is too high (>{}ms)", name, 60_000);
+                }
+            }
+        }
+        for (name, v) in [
+            ("btc_batch_cooldown_ms", self.rate_limiting.btc_batch_cooldown_ms),
+            ("eth_batch_cooldown_ms", self.rate_limiting.eth_batch_cooldown_ms),
+            ("sol_batch_cooldown_ms", self.rate_limiting.sol_batch_cooldown_ms),
+        ] {
+            if let Some(ms) = v {
+                if ms > 300_000 {
+                    anyhow::bail!("rate_limiting.{} is too high (>{}ms)", name, 300_000);
+                }
+            }
+        }
+
+        // BIP39 passphrase explosion guard: each passphrase multiplies work.
+        // Keep this conservative to prevent accidental OOM/network storms.
+        let passphrase_count = self.optimization.bip39_passphrases.len();
+        if passphrase_count > 5 {
+            anyhow::bail!(
+                "Too many BIP39 passphrases (max 5). Each passphrase multiplies work! Got {}",
+                passphrase_count
+            );
+        }
+        for (idx, p) in self.optimization.bip39_passphrases.iter().enumerate() {
+            if p.len() > 256 {
+                anyhow::bail!(
+                    "BIP39 passphrase #{} is too long (>{} chars)",
+                    idx,
+                    256
+                );
+            }
         }
 
         Ok(())
@@ -232,6 +309,12 @@ btc_paths = [
 min_delay_ms = 100
 batch_cooldown_ms = 1000
 max_retries = 10
+btc_min_delay_ms = 1000
+eth_min_delay_ms = 1000
+sol_min_delay_ms = 1000
+btc_batch_cooldown_ms = 0
+eth_batch_cooldown_ms = 0
+sol_batch_cooldown_ms = 0
 
 [optimization]
 use_bloom_filter = true
@@ -247,6 +330,9 @@ bip39_passphrases = [""]
 webhook_url = ""
 email = ""
 alert_on_find = true
+
+[api]
+etherscan_api_key = ""
 "#.to_string()
     }
 
@@ -292,6 +378,12 @@ impl Default for Config {
                 min_delay_ms: 100,
                 batch_cooldown_ms: 1000,
                 max_retries: 10,
+                btc_min_delay_ms: Some(1000),
+                eth_min_delay_ms: Some(1000),
+                sol_min_delay_ms: Some(1000),
+                btc_batch_cooldown_ms: Some(0),
+                eth_batch_cooldown_ms: Some(0),
+                sol_batch_cooldown_ms: Some(0),
             },
             optimization: OptimizationConfig {
                 use_bloom_filter: true,
@@ -302,6 +394,9 @@ impl Default for Config {
                 max_mutations_per_word: 10,
                 max_mutation_words: 1000,
                 bip39_passphrases: vec!["".to_string()],
+            },
+            api: ApiConfig {
+                etherscan_api_key: None,
             },
             notifications: NotificationConfig {
                 webhook_url: None,

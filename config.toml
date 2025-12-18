@@ -39,3 +39,6 @@ batch_size = 1000
 webhook_url = ""
 email = ""
 alert_on_find = true
+
+[api]
+etherscan_api_key = "api-key-here"

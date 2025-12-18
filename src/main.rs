@@ -19,6 +19,7 @@ use crate::dictionary::DictionaryLoader;
 use crate::pattern::PatternGenerator;
 use crate::wallet::WalletGenerator;
 use crate::balance::BalanceChecker;
+use crate::balance::SharedRateLimiter;
 use crate::stats::Statistics;
 use crate::checkpoint::CheckpointManager;
 use crate::bloom::BloomFilterManager;
@@ -150,6 +151,23 @@ async fn main() -> Result<()> {
         bloom_filter.clear();
     }
 
+    // Global, shared per-chain rate limiters (prevents worker-count multiplying request rate).
+    let btc_limiter = Arc::new(SharedRateLimiter::new(
+        config.rate_limiting.btc_min_delay_ms.unwrap_or(config.rate_limiting.min_delay_ms),
+        config.rate_limiting.btc_batch_cooldown_ms.unwrap_or(config.rate_limiting.batch_cooldown_ms),
+        50,
+    ));
+    let eth_limiter = Arc::new(SharedRateLimiter::new(
+        config.rate_limiting.eth_min_delay_ms.unwrap_or(config.rate_limiting.min_delay_ms),
+        config.rate_limiting.eth_batch_cooldown_ms.unwrap_or(config.rate_limiting.batch_cooldown_ms),
+        50,
+    ));
+    let sol_limiter = Arc::new(SharedRateLimiter::new(
+        config.rate_limiting.sol_min_delay_ms.unwrap_or(config.rate_limiting.min_delay_ms),
+        config.rate_limiting.sol_batch_cooldown_ms.unwrap_or(config.rate_limiting.batch_cooldown_ms),
+        50,
+    ));
+
     info!("Ensuring dictionaries are available...");
     DictionaryLoader::ensure_dictionaries(&config).await?;
 
@@ -195,6 +213,9 @@ async fn main() -> Result<()> {
         let config = config.clone();
         let bloom_filter = bloom_filter.clone();
         let stats = stats.clone();
+        let btc_limiter = btc_limiter.clone();
+        let eth_limiter = eth_limiter.clone();
+        let sol_limiter = sol_limiter.clone();
 
         let handle = tokio::spawn(async move {
             worker_task(
@@ -205,6 +226,9 @@ async fn main() -> Result<()> {
                 config,
                 bloom_filter,
                 stats,
+                btc_limiter,
+                eth_limiter,
+                sol_limiter,
             ).await
         });
 
@@ -339,6 +363,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_task(
     worker_id: usize,
     job_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PatternJob>>>,
@@ -347,6 +372,9 @@ async fn worker_task(
     config: Config,
     bloom_filter: Arc<BloomFilterManager>,
     stats: Arc<Statistics>,
+    btc_limiter: Arc<SharedRateLimiter>,
+    eth_limiter: Arc<SharedRateLimiter>,
+    sol_limiter: Arc<SharedRateLimiter>,
 ) {
     let wallet_generator = match WalletGenerator::new(&config) {
         Ok(gen) => gen,
@@ -356,7 +384,7 @@ async fn worker_task(
         }
     };
 
-    let balance_checker = match BalanceChecker::new(&config).await {
+    let balance_checker = match BalanceChecker::new(&config, btc_limiter, eth_limiter, sol_limiter).await {
         Ok(checker) => checker,
         Err(e) => {
             error!("Worker {}: Failed to create balance checker: {}", worker_id, e);
