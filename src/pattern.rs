@@ -46,9 +46,7 @@ impl AttackPattern {
             AttackPattern::KnownWeak { seed_hex } => Ok(seed_hex.clone()),
             AttackPattern::SingleWord { word } => Ok(word.clone()),
             AttackPattern::Bip39Repeat { word, count } => {
-                let words: Vec<String> = std::iter::repeat(word.clone())
-                    .take(*count)
-                    .collect();
+                let words: Vec<String> = std::iter::repeat_n(word.clone(), *count).collect();
                 Ok(words.join(" "))
             }
             AttackPattern::Bip39Sequential { start_index, count } => {

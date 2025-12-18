@@ -8,6 +8,12 @@ pub struct Statistics {
     start_time: AtomicU64,
 }
 
+impl Default for Statistics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Statistics {
     pub fn new() -> Self {
         let now = SystemTime::now()

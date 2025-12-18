@@ -3,7 +3,6 @@ use std::fs::{File, create_dir_all};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use tracing::{info, warn};
-use reqwest;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use once_cell::sync::Lazy;

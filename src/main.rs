@@ -209,46 +209,48 @@ async fn main() -> Result<()> {
         worker_handles.push(handle);
     }
 
-    // Producer task
-    let producer_handle = tokio::spawn({
-        let job_tx = job_tx.clone();
-        let bloom_filter = bloom_filter.clone();
-        let shutdown_tx = shutdown_tx.clone();
-
-        async move {
-            let mut sent_count = 0;
-
-            for (relative_idx, pattern) in patterns_iter.skip(start_index).enumerate() {
-                let i = start_index + relative_idx;
-
-                if i >= max_patterns {
-                    break;
-                }
-
-                // Check bloom filter
-                if bloom_filter.contains(&pattern) {
-                    continue;
-                }
-
-                let job = PatternJob {
-                    pattern,
-                    index: i,
-                    retry_count: 0,
-                };
-
-                if job_tx.send(job).await.is_err() {
-                    error!("Job channel closed, stopping producer");
-                    break;
-                }
-
-                sent_count += 1;
+    // Producer loop (run in main task to avoid `'static` requirement of `tokio::spawn`)
+    let mut sent_count = 0usize;
+    for (relative_idx, pattern) in patterns_iter.skip(start_index).enumerate() {
+        // Stop early if we received shutdown (Ctrl+C)
+        match shutdown_rx.try_recv() {
+            Ok(()) => {
+                info!("Producer received shutdown signal, stopping early...");
+                break;
             }
-
-            info!("Producer finished: {} patterns sent", sent_count);
-            drop(job_tx); // Signal completion
-            shutdown_tx.send(()).await.ok();
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                info!("Shutdown channel disconnected, stopping producer...");
+                break;
+            }
         }
-    });
+
+        let i = start_index + relative_idx;
+        if i >= max_patterns {
+            break;
+        }
+
+        // Check bloom filter
+        if bloom_filter.contains(&pattern) {
+            continue;
+        }
+
+        let job = PatternJob {
+            pattern,
+            index: i,
+            retry_count: 0,
+        };
+
+        if job_tx.send(job).await.is_err() {
+            error!("Job channel closed, stopping producer");
+            break;
+        }
+
+        sent_count += 1;
+    }
+
+    info!("Producer finished: {} patterns sent", sent_count);
+    drop(job_tx); // Signal completion
 
     // Result aggregator task
     let aggregator_handle = tokio::spawn({
@@ -267,12 +269,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for shutdown signal
-    shutdown_rx.recv().await;
-    info!("Shutdown signal received, cleaning up...");
+    info!("Cleaning up...");
 
     // Drop channels to signal workers
-    drop(job_tx);
     drop(retry_tx);
     drop(result_tx);
 
@@ -281,17 +280,27 @@ async fn main() -> Result<()> {
         let _ = handle.await;
     }
 
-    // Wait for producer and aggregator
-    let _ = producer_handle.await;
+    // Wait for aggregator
     let _ = aggregator_handle.await;
 
     // Final statistics
+    if bloom_filter.is_near_capacity() {
+        warn!(
+            "Bloom filter near capacity: {} / {} (auto-clear threshold ~95%)",
+            bloom_filter.len(),
+            bloom_filter.capacity()
+        );
+    }
+
     let final_stats = serde_json::json!({
         "checked": stats.checked(),
         "found": stats.found(),
         "rate": stats.get_rate(),
         "elapsed_seconds": stats.elapsed(),
         "bloom_filter_entries": bloom_filter.len(),
+        "bloom_filter_capacity": bloom_filter.capacity(),
+        "bloom_filter_is_empty": bloom_filter.is_empty(),
+        "bloom_filter_near_capacity": bloom_filter.is_near_capacity(),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "start_index": start_index,
         "max_patterns": max_patterns,
@@ -303,7 +312,13 @@ async fn main() -> Result<()> {
     info!("Found: {}", stats.found());
     info!("Rate: {:.2} w/s", stats.get_rate());
     info!("Elapsed: {:.2}s", stats.elapsed());
-    info!("Bloom filter entries: ~{}", bloom_filter.len());
+    info!(
+        "Bloom filter entries: ~{} / {} (near_capacity={}, empty={})",
+        bloom_filter.len(),
+        bloom_filter.capacity(),
+        bloom_filter.is_near_capacity(),
+        bloom_filter.is_empty()
+    );
     info!("═══════════════════════════════════════════════");
 
     std::fs::write(
@@ -467,8 +482,18 @@ async fn result_aggregator(
                 last_index = last_index.max(index);
 
                 if index % 100 == 0 {
-                    info!("[{}] Rate: {:.2} w/s | Found: {}",
-                        index, stats.get_rate(), stats.found());
+                    let progress = if max_patterns > 0 {
+                        (index as f64 / max_patterns as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    info!(
+                        "[{}] {:.2}% | Rate: {:.2} w/s | Found: {}",
+                        index,
+                        progress.min(100.0),
+                        stats.get_rate(),
+                        stats.found()
+                    );
                 }
 
                 if found || last_checkpoint.elapsed() > checkpoint_interval {

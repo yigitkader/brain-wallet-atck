@@ -68,6 +68,10 @@ impl BloomFilterManager {
         self.item_count.load(Ordering::Relaxed) as usize
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
     }

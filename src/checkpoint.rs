@@ -83,16 +83,6 @@ impl CheckpointManager {
         }
     }
 
-    /// Load checkpoint from file (with shared lock)
-    #[allow(dead_code)]
-    pub fn load(&self) -> Result<Option<usize>> {
-        if let Some(checkpoint) = self.load_full()? {
-            Ok(Some(checkpoint.last_index))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Load full checkpoint data
     pub fn load_full(&self) -> Result<Option<Checkpoint>> {
         if !Path::new(&self.path).exists() {
@@ -137,7 +127,7 @@ mod tests {
 
         manager.save(100, 50, 2, Some(1234567890)).unwrap();
 
-        let loaded_index = manager.load().unwrap();
+        let loaded_index = manager.load_full().unwrap().map(|c| c.last_index);
         assert_eq!(loaded_index, Some(100));
 
         let full_checkpoint = manager.load_full().unwrap().unwrap();
@@ -169,10 +159,10 @@ mod tests {
         let manager = CheckpointManager::new(checkpoint_path.to_str().unwrap()).unwrap();
 
         manager.save(100, 50, 2, None).unwrap();
-        assert!(manager.load().unwrap().is_some());
+        assert!(manager.load_full().unwrap().is_some());
 
         manager.clear().unwrap();
-        assert!(manager.load().unwrap().is_none());
+        assert!(manager.load_full().unwrap().is_none());
     }
 
     #[test]
@@ -189,7 +179,14 @@ mod tests {
         for i in 0..10 {
             let manager_clone = manager.clone();
             let handle = thread::spawn(move || {
-                manager_clone.save(i * 100, i * 50, i * 2, Some(1234567890 + i as u64)).unwrap();
+                manager_clone
+                    .save(
+                        i * 100,
+                        (i * 50) as u64,
+                        (i * 2) as u64,
+                        Some(1234567890 + i as u64),
+                    )
+                    .unwrap();
             });
             handles.push(handle);
         }

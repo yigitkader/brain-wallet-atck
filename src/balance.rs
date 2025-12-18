@@ -297,7 +297,7 @@ impl BalanceChecker {
             std::sync::atomic::Ordering::SeqCst
         );
 
-        if count % 50 == 0 {
+        if count.is_multiple_of(50) {
             sleep(Duration::from_millis(self.config.rate_limiting.batch_cooldown_ms)).await;
         }
 

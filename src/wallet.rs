@@ -61,7 +61,7 @@ impl WalletGenerator {
             }
 
             AttackPattern::Bip39Repeat { word, count } => {
-                let words: Vec<&str> = std::iter::repeat(word.as_str()).take(*count).collect();
+                let words: Vec<&str> = std::iter::repeat_n(word.as_str(), *count).collect();
                 let repeated = words.join(" ");
 
                 if let Ok(mnemonic) = Mnemonic::parse_in_normalized(Language::English, &repeated) {
