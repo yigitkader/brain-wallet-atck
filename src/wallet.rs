@@ -12,6 +12,13 @@ use crate::pattern::AttackPattern;
 
 type HmacSha512 = Hmac<sha2::Sha512>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BtcAddressType {
+    LegacyP2pkh,
+    SegwitP2shP2wpkh,
+    NativeSegwitP2wpkh,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WalletAddresses {
     pub btc: Vec<String>,
@@ -110,26 +117,65 @@ impl WalletGenerator {
 
             let pubkey = derived.to_priv().public_key(&self.secp);
 
-            let address = if path_str.starts_with("m/44'/0'/") {
-                bitcoin::Address::p2pkh(&pubkey, Network::Bitcoin)
-            } else if path_str.starts_with("m/49'/0'/") {
-                bitcoin::Address::p2shwpkh(&pubkey, Network::Bitcoin)
-                    .context("Failed to create SegWit address")?
-            } else if path_str.starts_with("m/84'/0'/") {
-                bitcoin::Address::p2wpkh(&pubkey, Network::Bitcoin)
-                    .context("Failed to create Native SegWit address")?
-            } else {
-                bail!(
-                    "Unsupported Bitcoin derivation path: {}. \
-                    Supported paths: m/44'/0' (Legacy), m/49'/0' (SegWit), m/84'/0' (Native SegWit)",
-                    path_str
-                );
+            let addr_type = match Self::btc_address_type_for_path(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    bail!("Unsupported Bitcoin derivation path: {} ({})", path_str, e);
+                }
+            };
+
+            let address = match addr_type {
+                BtcAddressType::LegacyP2pkh => bitcoin::Address::p2pkh(&pubkey, Network::Bitcoin),
+                BtcAddressType::SegwitP2shP2wpkh => bitcoin::Address::p2shwpkh(&pubkey, Network::Bitcoin)
+                    .context("Failed to create SegWit address")?,
+                BtcAddressType::NativeSegwitP2wpkh => bitcoin::Address::p2wpkh(&pubkey, Network::Bitcoin)
+                    .context("Failed to create Native SegWit address")?,
             };
 
             addresses.push(address.to_string());
         }
 
         Ok(addresses)
+    }
+
+    /// Strict BTC derivation path validation:
+    /// Only accept m/{44,49,84}'/0'/0'/0/0
+    fn btc_address_type_for_path(path: &DerivationPath) -> Result<BtcAddressType> {
+        use bitcoin::util::bip32::ChildNumber;
+
+        let comps: Vec<ChildNumber> = path.into_iter().cloned().collect();
+        if comps.len() != 5 {
+            bail!("BTC derivation path must have exactly 5 components (m/purpose'/coin_type'/account'/change/index)");
+        }
+
+        let purpose = comps[0];
+        let coin_type = comps[1];
+        let account = comps[2];
+        let change = comps[3];
+        let index = comps[4];
+
+        if coin_type != ChildNumber::from_hardened_idx(0)? {
+            bail!("BTC derivation path coin_type must be 0'");
+        }
+        if account != ChildNumber::from_hardened_idx(0)? {
+            bail!("BTC derivation path account must be 0'");
+        }
+        if change != ChildNumber::from_normal_idx(0)? {
+            bail!("BTC derivation path change must be 0");
+        }
+        if index != ChildNumber::from_normal_idx(0)? {
+            bail!("BTC derivation path index must be 0");
+        }
+
+        if purpose == ChildNumber::from_hardened_idx(44)? {
+            Ok(BtcAddressType::LegacyP2pkh)
+        } else if purpose == ChildNumber::from_hardened_idx(49)? {
+            Ok(BtcAddressType::SegwitP2shP2wpkh)
+        } else if purpose == ChildNumber::from_hardened_idx(84)? {
+            Ok(BtcAddressType::NativeSegwitP2wpkh)
+        } else {
+            bail!("BTC derivation path purpose must be 44', 49', or 84'");
+        }
     }
 
     /// Generate Ethereum address with EIP-55 checksum
@@ -208,7 +254,28 @@ impl WalletGenerator {
             bail!("Ed25519 public key must be 32 bytes, got {}", pubkey_bytes.len());
         }
 
-        Ok(bs58::encode(&pubkey_bytes).into_string())
+        let address = bs58::encode(&pubkey_bytes).into_string();
+
+        // Validate: base58 roundtrip should preserve bytes and be canonical
+        let decoded = bs58::decode(&address)
+            .into_vec()
+            .context("Failed to decode generated Solana address (base58)")?;
+
+        if decoded.len() != 32 {
+            bail!(
+                "Generated Solana address decoded length must be 32 bytes, got {}",
+                decoded.len()
+            );
+        }
+        if decoded.as_slice() != pubkey_bytes.as_slice() {
+            bail!("Generated Solana address roundtrip mismatch");
+        }
+        let reencoded = bs58::encode(&decoded).into_string();
+        if reencoded != address {
+            bail!("Generated Solana address is not canonical base58");
+        }
+
+        Ok(address)
     }
 
     fn keccak256(data: &[u8]) -> [u8; 32] {
@@ -245,6 +312,43 @@ mod tests {
         assert!(wallets.btc[0].starts_with("1"));
         assert!(wallets.btc[1].starts_with("3"));
         assert!(wallets.btc[2].starts_with("bc1"));
+    }
+
+    #[test]
+    fn test_btc_derivation_path_rejects_nonzero_account() {
+        let mut config = Config::default();
+        config.chains.btc_paths = vec![
+            "m/44'/0'/1'/0/0".to_string(),
+        ];
+        let generator = WalletGenerator::new(&config).unwrap();
+
+        let pattern = crate::pattern::AttackPattern::SingleWord {
+            word: "test".to_string(),
+        };
+
+        let err = generator.generate(&pattern).unwrap_err().to_string();
+        assert!(err.contains("account must be 0'"), "got error: {}", err);
+    }
+
+    #[test]
+    fn test_btc_derivation_path_rejects_nonzero_change_or_index() {
+        let mut config = Config::default();
+        config.chains.btc_paths = vec![
+            "m/84'/0'/0'/1/0".to_string(),
+            "m/84'/0'/0'/0/1".to_string(),
+        ];
+        let generator = WalletGenerator::new(&config).unwrap();
+
+        let pattern = crate::pattern::AttackPattern::SingleWord {
+            word: "test".to_string(),
+        };
+
+        let err = generator.generate(&pattern).unwrap_err().to_string();
+        assert!(
+            err.contains("change must be 0") || err.contains("index must be 0"),
+            "got error: {}",
+            err
+        );
     }
 
     #[test]

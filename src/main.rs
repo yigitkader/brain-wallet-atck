@@ -163,7 +163,9 @@ async fn main() -> Result<()> {
 
     // Channel setup
     let (job_tx, job_rx) = mpsc::channel::<PatternJob>(1000);
-    let (retry_tx, retry_rx) = mpsc::channel::<PatternJob>(500);
+    // Retry queue is unbounded to avoid deadlock/backpressure during rate-limit storms.
+    // Bounded retry can cause `result_aggregator` to block on `.send().await`, stalling progress.
+    let (retry_tx, retry_rx) = mpsc::unbounded_channel::<PatternJob>();
     let (result_tx, result_rx) = mpsc::channel::<ProcessResult>(1000);
 
     let job_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
@@ -340,7 +342,7 @@ async fn main() -> Result<()> {
 async fn worker_task(
     worker_id: usize,
     job_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PatternJob>>>,
-    retry_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PatternJob>>>,
+    retry_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<PatternJob>>>,
     result_tx: mpsc::Sender<ProcessResult>,
     config: Config,
     bloom_filter: Arc<BloomFilterManager>,
@@ -363,17 +365,18 @@ async fn worker_task(
     };
 
     loop {
-        // Priority 1: Process retry queue first
-        let job = {
-            let mut retry = retry_rx.lock().await;
-            if let Ok(job) = retry.try_recv() {
-                Some(job)
-            } else {
-                drop(retry);
-                // Priority 2: Process normal queue
+        // Retry jobs should have priority and must not starve behind new work.
+        // Use a biased select between the two shared receivers.
+        let job = tokio::select! {
+            biased;
+            retry_job = async {
+                let mut retry = retry_rx.lock().await;
+                retry.recv().await
+            } => retry_job,
+            normal_job = async {
                 let mut jobs = job_rx.lock().await;
                 jobs.recv().await
-            }
+            } => normal_job,
         };
 
         let job = match job {
@@ -467,7 +470,7 @@ async fn worker_task(
 
 async fn result_aggregator(
     mut result_rx: mpsc::Receiver<ProcessResult>,
-    retry_tx: mpsc::Sender<PatternJob>,
+    retry_tx: mpsc::UnboundedSender<PatternJob>,
     checkpoint_manager: Arc<CheckpointManager>,
     stats: Arc<Statistics>,
     max_patterns: usize,
@@ -510,7 +513,7 @@ async fn result_aggregator(
             }
 
             ProcessResult::RateLimited { job } => {
-                if let Err(e) = retry_tx.send(job).await {
+                if let Err(e) = retry_tx.send(job) {
                     error!("Failed to send to retry queue: {}", e);
                 }
             }

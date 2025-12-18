@@ -118,6 +118,7 @@ impl CheckpointManager {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use std::io::Write;
 
     #[test]
     fn test_checkpoint_save_and_load() {
@@ -198,5 +199,20 @@ mod tests {
         // Should successfully save without corruption
         let checkpoint = manager.load_full().unwrap();
         assert!(checkpoint.is_some());
+    }
+
+    #[test]
+    fn test_checkpoint_load_full_rejects_corrupt_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join("corrupt_checkpoint.json");
+        let manager = CheckpointManager::new(checkpoint_path.to_str().unwrap()).unwrap();
+
+        // Write invalid JSON
+        let mut f = File::create(&checkpoint_path).unwrap();
+        f.write_all(b"{ this is not valid json").unwrap();
+        f.flush().unwrap();
+
+        let err = manager.load_full().unwrap_err().to_string();
+        assert!(err.contains("Failed to parse checkpoint"));
     }
 }

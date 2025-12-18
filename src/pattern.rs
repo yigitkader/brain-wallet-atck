@@ -160,12 +160,14 @@ impl PatternGenerator {
             .flat_map(move |password| {
                 let password = password.clone();
                 let numbers = important_numbers.clone(); // Arc clone (cheap)
-                numbers.iter().map(move |&number| {
+                let len = numbers.len();
+                (0..len).map(move |i| {
+                    let number = numbers[i];
                     AttackPattern::PasswordNumber {
                         password: password.clone(),
                         number,
                     }
-                }).collect::<Vec<_>>().into_iter()
+                })
             });
 
         let name_date_iter = dictionaries.names.iter().flat_map(|name| {

@@ -5,9 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 
 pub struct BloomFilterManager {
-    filter: parking_lot::RwLock<InternalBloom>,
-    item_count: AtomicU64,
+    active: parking_lot::RwLock<InternalBloom>,
+    previous: parking_lot::RwLock<Option<InternalBloom>>,
+    active_count: AtomicU64,
+    previous_count: AtomicU64,
     capacity: usize,
+    false_positive_rate: f64,
 }
 
 impl BloomFilterManager {
@@ -18,44 +21,110 @@ impl BloomFilterManager {
         let filter = InternalBloom::with_rate(fp_rate as f32, items_count as u32);
 
         Self {
-            filter: parking_lot::RwLock::new(filter),
-            item_count: AtomicU64::new(0),
+            active: parking_lot::RwLock::new(filter),
+            previous: parking_lot::RwLock::new(None),
+            active_count: AtomicU64::new(0),
+            previous_count: AtomicU64::new(0),
             capacity,
+            false_positive_rate,
         }
     }
 
     /// Check if pattern exists in bloom filter
     pub fn contains<T: Hash>(&self, item: &T) -> bool {
         let hash = Self::hash_item(item);
-        self.filter.read().contains(&hash)
+        if self.active.read().contains(&hash) {
+            return true;
+        }
+        self.previous
+            .read()
+            .as_ref()
+            .is_some_and(|prev| prev.contains(&hash))
     }
 
     /// Add pattern to bloom filter (with atomic capacity check)
     /// FIXED: Atomic check-and-add to prevent race conditions
     pub fn add<T: Hash>(&self, item: &T) -> Result<()> {
-        // FIXED: Atomic capacity check before increment
-        let current = self.item_count.load(Ordering::Acquire);
+        // If active filter is near capacity, rotate it to "previous" instead of clearing.
+        // This avoids losing duplicate knowledge for already-seen patterns.
+        //
+        // Also handle rare races where multiple threads increment concurrently:
+        // if we detect overflow, rotate and retry instead of erroring.
+        for _attempt in 0..2 {
+            self.rotate_if_needed();
 
-        // Auto-clear at 95% to prevent overflow
-        if current >= (self.capacity as u64 * 95 / 100) {
-            use tracing::warn;
-            warn!("Bloom filter 95% full ({} / {}), auto-clearing...",
-                  current, self.capacity);
-            self.clear();
+            // Try to increment atomically (active only)
+            let new_count = self.active_count.fetch_add(1, Ordering::AcqRel) + 1;
+            if new_count > self.capacity as u64 {
+                // Rollback increment and rotate, then retry once.
+                self.active_count.fetch_sub(1, Ordering::AcqRel);
+                self.rotate_force();
+                continue;
+            }
+
+            let hash = Self::hash_item(item);
+            self.active.write().insert(&hash);
+
+            // If we just pushed the counter near the threshold, rotate for subsequent inserts.
+            self.rotate_if_needed();
+            return Ok(());
         }
 
-        // FIXED: Try to increment atomically
-        let new_count = self.item_count.fetch_add(1, Ordering::AcqRel) + 1;
+        anyhow::bail!("Bloom filter capacity exceeded after rotation retry (capacity={})", self.capacity)
+    }
 
-        if new_count > self.capacity as u64 {
-            // Rollback increment
-            self.item_count.fetch_sub(1, Ordering::AcqRel);
-            anyhow::bail!("Bloom filter capacity exceeded: {} (max: {})", new_count, self.capacity);
+    fn rotate_if_needed(&self) {
+        let current = self.active_count.load(Ordering::Acquire);
+        let threshold = self.capacity as u64 * 95 / 100;
+        if current < threshold {
+            return;
         }
 
-        let hash = Self::hash_item(item);
-        self.filter.write().insert(&hash);
-        Ok(())
+        // Single-writer rotate using active write lock; keep previous coherent.
+        let mut active = self.active.write();
+        let mut previous = self.previous.write();
+
+        // Double-check under lock to avoid unnecessary rotations.
+        let current_locked = self.active_count.load(Ordering::Acquire);
+        if current_locked < threshold {
+            return;
+        }
+
+        use tracing::warn;
+        warn!(
+            "Bloom filter near capacity ({} / {}), rotating buffers...",
+            current_locked,
+            self.capacity
+        );
+
+        let new_active = InternalBloom::with_rate(self.false_positive_rate as f32, self.capacity as u32);
+        let old_active = std::mem::replace(&mut *active, new_active);
+        *previous = Some(old_active);
+
+        self.previous_count.store(current_locked, Ordering::Release);
+        self.active_count.store(0, Ordering::Release);
+    }
+
+    fn rotate_force(&self) {
+        // Single-writer rotate using active write lock; keep previous coherent.
+        let mut active = self.active.write();
+        let mut previous = self.previous.write();
+
+        let current_locked = self.active_count.load(Ordering::Acquire);
+
+        use tracing::warn;
+        warn!(
+            "Bloom filter at capacity ({} / {}), forcing rotation...",
+            current_locked,
+            self.capacity
+        );
+
+        let new_active = InternalBloom::with_rate(self.false_positive_rate as f32, self.capacity as u32);
+        let old_active = std::mem::replace(&mut *active, new_active);
+        *previous = Some(old_active);
+
+        self.previous_count.store(current_locked, Ordering::Release);
+        self.active_count.store(0, Ordering::Release);
     }
 
     fn hash_item<T: Hash>(item: &T) -> u64 {
@@ -65,7 +134,7 @@ impl BloomFilterManager {
     }
 
     pub fn len(&self) -> usize {
-        self.item_count.load(Ordering::Relaxed) as usize
+        (self.active_count.load(Ordering::Relaxed) + self.previous_count.load(Ordering::Relaxed)) as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -77,13 +146,15 @@ impl BloomFilterManager {
     }
 
     pub fn is_near_capacity(&self) -> bool {
-        let current_count = self.item_count.load(Ordering::Relaxed) as usize;
+        let current_count = self.active_count.load(Ordering::Relaxed) as usize;
         current_count >= (self.capacity * 95 / 100)
     }
 
     pub fn clear(&self) {
-        self.filter.write().clear();
-        self.item_count.store(0, Ordering::Release);
+        self.active.write().clear();
+        *self.previous.write() = None;
+        self.active_count.store(0, Ordering::Release);
+        self.previous_count.store(0, Ordering::Release);
     }
 }
 
@@ -104,21 +175,21 @@ mod tests {
     }
 
     #[test]
-    fn test_bloom_filter_auto_clear() {
+    fn test_bloom_filter_auto_rotate() {
         let bloom = BloomFilterManager::new(100, 0.01);
 
         for i in 0..95 {
             bloom.add(&format!("item_{}", i)).unwrap();
         }
 
-        assert!(bloom.is_near_capacity());
         assert_eq!(bloom.len(), 95);
 
         bloom.add(&"item_95").unwrap();
 
-        assert_eq!(bloom.len(), 1);
+        // Rotation keeps previous entries while starting a new active filter.
+        assert_eq!(bloom.len(), 96);
         assert!(bloom.contains(&"item_95"));
-        assert!(!bloom.contains(&"item_0"));
+        assert!(bloom.contains(&"item_0"));
     }
 
     #[test]
@@ -129,10 +200,10 @@ mod tests {
             bloom.add(&format!("item_{}", i)).unwrap();
         }
 
-        assert!(bloom.is_near_capacity());
         bloom.add(&"item_9").unwrap();
 
-        assert_eq!(bloom.len(), 1);
+        // Rotation keeps previous entries while starting a new active filter.
+        assert_eq!(bloom.len(), 10);
     }
 
     #[test]
@@ -179,5 +250,33 @@ mod tests {
         // Should have added ~1000 items (some may be deduplicated)
         assert!(bloom.len() <= 1000);
         assert!(bloom.len() >= 900); // Allow some duplicates
+    }
+
+    #[test]
+    fn test_bloom_filter_concurrent_overflow_never_errors() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Tiny capacity to force frequent rotations and hit overflow races.
+        let bloom = Arc::new(BloomFilterManager::new(32, 0.01));
+        let mut handles = vec![];
+
+        for t in 0..8 {
+            let bloom_clone = bloom.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..200 {
+                    let item = format!("t{}_{}", t, i);
+                    bloom_clone.add(&item).expect("add() should not error under concurrent overflow/rotation");
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // We inserted 1600 unique items; bloom is probabilistic and rotates,
+        // so we only sanity-check that some items were recorded.
+        assert!(!bloom.is_empty());
     }
 }

@@ -5,9 +5,51 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, warn};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::wallet::WalletAddresses;
+
+type HttpResult = Result<(u16, String)>;
+type HttpFuture = Pin<Box<dyn Future<Output = HttpResult> + Send>>;
+
+trait HttpClient: Send + Sync {
+    fn get(&self, url: String) -> HttpFuture;
+    fn post_json(&self, url: String, json_body: String) -> HttpFuture;
+}
+
+struct ReqwestHttpClient {
+    client: Client,
+}
+
+impl HttpClient for ReqwestHttpClient {
+    fn get(&self, url: String) -> HttpFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let resp = client.get(&url).send().await
+                .with_context(|| format!("Failed to GET {}", url))?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await.context("Failed to read response body")?;
+            Ok((status, text))
+        })
+    }
+
+    fn post_json(&self, url: String, json_body: String) -> HttpFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let resp = client.post(&url)
+                .header("content-type", "application/json")
+                .body(json_body)
+                .send().await
+                .with_context(|| format!("Failed to POST {}", url))?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await.context("Failed to read response body")?;
+            Ok((status, text))
+        })
+    }
+}
 
 /// Balance results for all chains
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,8 +68,12 @@ impl BalanceResults {
 /// Balance checker with rate limiting
 pub struct BalanceChecker {
     config: Config,
-    client: Client,
+    http: Arc<dyn HttpClient>,
     request_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    eth_etherscan_base: String,
+    eth_blockcypher_base: String,
+    eth_blockchair_base: String,
+    sol_rpc_endpoints: Vec<String>,
 }
 
 impl BalanceChecker {
@@ -37,11 +83,41 @@ impl BalanceChecker {
             .user_agent("BrainwalletAuditor/1.0")
             .build()?;
 
+        let http: Arc<dyn HttpClient> = Arc::new(ReqwestHttpClient { client });
+
         Ok(Self {
             config: config.clone(),
-            client,
+            http,
             request_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eth_etherscan_base: "https://api.etherscan.io".to_string(),
+            eth_blockcypher_base: "https://api.blockcypher.com".to_string(),
+            eth_blockchair_base: "https://api.blockchair.com".to_string(),
+            sol_rpc_endpoints: vec![
+                "https://api.mainnet-beta.solana.com".to_string(),
+                "https://solana-api.projectserum.com".to_string(),
+                "https://rpc.ankr.com/solana".to_string(),
+            ],
         })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        config: &Config,
+        http: Arc<dyn HttpClient>,
+        eth_etherscan_base: String,
+        eth_blockcypher_base: String,
+        eth_blockchair_base: String,
+        sol_rpc_endpoints: Vec<String>,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            http,
+            request_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eth_etherscan_base,
+            eth_blockcypher_base,
+            eth_blockchair_base,
+            sol_rpc_endpoints,
+        }
     }
 
     /// Check if error is a rate limit error (429)
@@ -149,28 +225,81 @@ impl BalanceChecker {
 
         // Check Ethereum address (failures logged but don't fail entire check)
         self.rate_limit().await;
-        match self.check_eth_balance(&wallets.eth).await {
+        match self.check_with_retry(|| self.check_eth_balance(&wallets.eth), max_retries).await {
             Ok(balance) => {
                 if balance > 0.0 {
                     results.eth = Some(balance);
                 }
             }
             Err(e) => {
-                warn!("ETH balance check failed for {}: {}. Continuing with other chains.", wallets.eth, e);
+                warn!(
+                    "Primary ETH API failed for {} after retries: {}, trying fallbacks...",
+                    wallets.eth, e
+                );
+                match self.check_with_retry(|| self.check_eth_balance_blockcypher(&wallets.eth), max_retries).await {
+                    Ok(b) => {
+                        if b > 0.0 {
+                            results.eth = Some(b);
+                        }
+                    }
+                    Err(e2) => {
+                        match self.check_with_retry(|| self.check_eth_balance_blockchair(&wallets.eth), max_retries).await {
+                            Ok(b) => {
+                                if b > 0.0 {
+                                    results.eth = Some(b);
+                                }
+                            }
+                            Err(e3) => {
+                                warn!(
+                                    "All ETH API attempts failed for {}: primary={}, blockcypher={}, blockchair={}. Continuing with other chains.",
+                                    wallets.eth, e, e2, e3
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
         // Check Solana address (failures logged but don't fail entire check)
         if let Some(sol_address) = &wallets.sol {
             self.rate_limit().await;
-            match self.check_sol_balance(sol_address).await {
+            match self.check_with_retry(|| self.check_sol_balance(sol_address), max_retries).await {
                 Ok(balance) => {
                     if balance > 0.0 {
                         results.sol = Some(balance);
                     }
                 }
                 Err(e) => {
-                    warn!("SOL balance check failed for {}: {}. Continuing with other chains.", sol_address, e);
+                    warn!(
+                        "Primary SOL RPC failed for {} after retries: {}, trying fallbacks...",
+                        sol_address, e
+                    );
+                    // Try remaining endpoints (index 1..)
+                    let mut last = e;
+                    for endpoint in self.sol_rpc_endpoints.iter().skip(1) {
+                        match self.check_with_retry(
+                            || self.check_sol_balance_with_endpoint(sol_address, endpoint),
+                            max_retries,
+                        )
+                        .await
+                        {
+                            Ok(b) => {
+                                if b > 0.0 {
+                                    results.sol = Some(b);
+                                }
+                                last = anyhow::anyhow!("resolved via fallback");
+                                break;
+                            }
+                            Err(err) => last = err,
+                        }
+                    }
+                    if last.to_string() != "resolved via fallback" {
+                        warn!(
+                            "All SOL RPC attempts failed for {}. Last error: {}. Continuing with other chains.",
+                            sol_address, last
+                        );
+                    }
                 }
             }
         }
@@ -188,20 +317,17 @@ impl BalanceChecker {
 
         let url = format!("https://api.blockcypher.com/v1/btc/main/addrs/{}", address);
 
-        let response = self.client
-            .get(&url)
-            .send()
-            .await
+        let (status, body) = self.http.get(url.clone()).await
             .context("Failed to fetch BTC balance")?;
 
-        if !response.status().is_success() {
-            if response.status() == 429 {
+        if !(200..300).contains(&status) {
+            if status == 429 {
                 bail!("Rate limited (429) - increase delays in config");
             }
-            bail!("API error: {} - {}", response.status(), url);
+            bail!("API error: {} - {}", status, url);
         }
 
-        let data: BlockCypherResponse = response.json().await?;
+        let data: BlockCypherResponse = serde_json::from_str(&body)?;
         let total_satoshis = data.balance + data.unconfirmed_balance;
 
         Ok(total_satoshis as f64 / 100_000_000.0)
@@ -215,32 +341,101 @@ impl BalanceChecker {
         }
 
         let url = format!(
-            "https://api.etherscan.io/api?module=account&action=balance&address={}&tag=latest",
+            "{}/api?module=account&action=balance&address={}&tag=latest",
+            self.eth_etherscan_base.trim_end_matches('/'),
             address
         );
 
-        let response = self.client
-            .get(&url)
-            .send()
-            .await
+        let (status, body) = self.http.get(url.clone()).await
             .context("Failed to fetch ETH balance")?;
 
-        if !response.status().is_success() {
-            if response.status() == 429 {
+        if !(200..300).contains(&status) {
+            if status == 429 {
                 bail!("Rate limited (429) - increase delays in config");
             }
-            bail!("API error: {} - {}", response.status(), url);
+            bail!("API error: {} - {}", status, url);
         }
 
-        let data: EtherscanResponse = response.json().await?;
+        let data: EtherscanResponse = serde_json::from_str(&body)?;
         let wei: u128 = data.result.parse()
             .context(format!("Failed to parse ETH balance from API response: {}", data.result))?;
 
         Ok(wei as f64 / 1e18)
     }
 
+    /// Fallback ETH balance check using BlockCypher (no API key required for basic usage)
+    async fn check_eth_balance_blockcypher(&self, address: &str) -> Result<f64> {
+        #[derive(Deserialize)]
+        struct BlockCypherEthResponse {
+            balance: u128,
+        }
+
+        let url = format!(
+            "{}/v1/eth/main/addrs/{}/balance",
+            self.eth_blockcypher_base.trim_end_matches('/'),
+            address
+        );
+        let (status, body) = self.http.get(url.clone()).await
+            .context("Failed to fetch ETH balance (BlockCypher)")?;
+
+        if !(200..300).contains(&status) {
+            if status == 429 {
+                bail!("Rate limited (429) - increase delays in config");
+            }
+            bail!("API error: {} - {}", status, url);
+        }
+
+        let data: BlockCypherEthResponse = serde_json::from_str(&body)?;
+        Ok(data.balance as f64 / 1e18)
+    }
+
+    /// Fallback ETH balance check using Blockchair
+    async fn check_eth_balance_blockchair(&self, address: &str) -> Result<f64> {
+        #[derive(Deserialize)]
+        struct BlockchairResp {
+            data: HashMap<String, BlockchairAddr>,
+        }
+        #[derive(Deserialize)]
+        struct BlockchairAddr {
+            address: BlockchairAddrInner,
+        }
+        #[derive(Deserialize)]
+        struct BlockchairAddrInner {
+            balance: String, // can exceed u64, represented as string in wei
+        }
+
+        let url = format!(
+            "{}/ethereum/dashboards/address/{}",
+            self.eth_blockchair_base.trim_end_matches('/'),
+            address
+        );
+        let (status, body) = self.http.get(url.clone()).await
+            .context("Failed to fetch ETH balance (Blockchair)")?;
+
+        if !(200..300).contains(&status) {
+            if status == 429 {
+                bail!("Rate limited (429) - increase delays in config");
+            }
+            bail!("API error: {} - {}", status, url);
+        }
+
+        let data: BlockchairResp = serde_json::from_str(&body)?;
+        let entry = data.data.get(address)
+            .ok_or_else(|| anyhow::anyhow!("Blockchair returned no data for address {}", address))?;
+        let wei: u128 = entry.address.balance.parse()
+            .context(format!("Failed to parse ETH balance from Blockchair: {}", entry.address.balance))?;
+        Ok(wei as f64 / 1e18)
+    }
+
     /// Check Solana balance using Solana RPC
     async fn check_sol_balance(&self, address: &str) -> Result<f64> {
+        let endpoint = self.sol_rpc_endpoints
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No Solana RPC endpoints configured"))?;
+        self.check_sol_balance_with_endpoint(address, endpoint).await
+    }
+
+    async fn check_sol_balance_with_endpoint(&self, address: &str, endpoint: &str) -> Result<f64> {
         #[derive(Serialize)]
         struct RpcRequest {
             jsonrpc: String,
@@ -266,21 +461,18 @@ impl BalanceChecker {
             params: vec![address.to_string()],
         };
 
-        let response = self.client
-            .post("https://api.mainnet-beta.solana.com")
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to fetch SOL balance")?;
+        let body = serde_json::to_string(&request)?;
+        let (status, resp_body) = self.http.post_json(endpoint.to_string(), body).await
+            .with_context(|| format!("Failed to fetch SOL balance from {}", endpoint))?;
 
-        if !response.status().is_success() {
-            if response.status() == 429 {
+        if !(200..300).contains(&status) {
+            if status == 429 {
                 bail!("Rate limited (429) - increase delays in config");
             }
-            bail!("API error: {} - Solana RPC", response.status());
+            bail!("API error: {} - Solana RPC ({})", status, endpoint);
         }
 
-        let data: RpcResponse = response.json().await?;
+        let data: RpcResponse = serde_json::from_str(&resp_body)?;
         let lamports = data.result
             .ok_or_else(|| anyhow::anyhow!("Solana RPC returned None result for address {}", address))?
             .value;
@@ -316,19 +508,16 @@ impl BalanceChecker {
 
         let url = format!("https://blockchain.info/rawaddr/{}", address);
 
-        let response = self.client
-            .get(&url)
-            .send()
-            .await?;
+        let (status, body) = self.http.get(url.clone()).await?;
 
-        if !response.status().is_success() {
-            if response.status() == 429 {
+        if !(200..300).contains(&status) {
+            if status == 429 {
                 bail!("Rate limited (429) - increase delays in config");
             }
-            bail!("API error: {} - {}", response.status(), url);
+            bail!("API error: {} - {}", status, url);
         }
 
-        let data: BlockchainResponse = response.json().await?;
+        let data: BlockchainResponse = serde_json::from_str(&body)?;
         Ok(data.final_balance as f64 / 100_000_000.0)
     }
 }
@@ -336,6 +525,7 @@ impl BalanceChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockall::mock;
 
     #[tokio::test]
     #[ignore]
@@ -371,5 +561,101 @@ mod tests {
 
         let error3 = anyhow::anyhow!("Connection timeout");
         assert!(!BalanceChecker::is_rate_limit_error(&error3));
+    }
+
+    mock! {
+        Http {}
+        impl HttpClient for Http {
+            fn get(&self, url: String) -> HttpFuture;
+            fn post_json(&self, url: String, json_body: String) -> HttpFuture;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_eth_fallback_primary_fails_blockcypher_succeeds() {
+        let mut http = MockHttp::new();
+        http.expect_get()
+            .returning(|url| {
+                Box::pin(async move {
+                    if url.contains("etherscan") {
+                        Ok((500, r#"{"result":"0"}"#.to_string()))
+                    } else if url.contains("blockcypher") {
+                        Ok((200, r#"{"balance":1000000000000000000}"#.to_string()))
+                    } else if url.contains("blockchair") {
+                        Ok((500, r#"{}"#.to_string()))
+                    } else {
+                        Ok((404, r#"{}"#.to_string()))
+                    }
+                })
+            });
+        http.expect_post_json()
+            .returning(|_url, _body| Box::pin(async { Ok((500, r#"{}"#.to_string())) }));
+
+        let mut config = Config::default();
+        config.rate_limiting.min_delay_ms = 0;
+        config.rate_limiting.batch_cooldown_ms = 0;
+        config.rate_limiting.max_retries = 1;
+
+        let http: Arc<dyn HttpClient> = Arc::new(http);
+        let checker = BalanceChecker::new_for_test(
+            &config,
+            http,
+            "https://api.etherscan.io".to_string(),
+            "https://api.blockcypher.com".to_string(),
+            "https://api.blockchair.com".to_string(),
+            vec!["http://127.0.0.1:1".to_string()], // unused here
+        );
+
+        let wallets = WalletAddresses {
+            btc: vec![],
+            eth: "0x0000000000000000000000000000000000000000".to_string(),
+            sol: None,
+        };
+
+        let res = checker.check(&wallets).await.unwrap();
+        assert_eq!(res.eth, Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn test_sol_fallback_primary_fails_secondary_succeeds() {
+        let mut http = MockHttp::new();
+        http.expect_get()
+            .returning(|_url| Box::pin(async { Ok((404, r#"{}"#.to_string())) }));
+        http.expect_post_json()
+            .returning(|url, _body| {
+                Box::pin(async move {
+                    if url.contains("primary") {
+                        Ok((500, r#"{}"#.to_string()))
+                    } else if url.contains("secondary") {
+                        Ok((200, r#"{"result":{"value":1000000000}}"#.to_string()))
+                    } else {
+                        Ok((404, r#"{}"#.to_string()))
+                    }
+                })
+            });
+
+        let mut config = Config::default();
+        config.rate_limiting.min_delay_ms = 0;
+        config.rate_limiting.batch_cooldown_ms = 0;
+        config.rate_limiting.max_retries = 1;
+
+        let http: Arc<dyn HttpClient> = Arc::new(http);
+        let checker = BalanceChecker::new_for_test(
+            &config,
+            http,
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            vec!["http://primary".to_string(), "http://secondary".to_string()],
+        );
+
+        let wallets = WalletAddresses {
+            btc: vec![],
+            eth: "0x0000000000000000000000000000000000000000".to_string(),
+            sol: Some("So11111111111111111111111111111111111111112".to_string()),
+        };
+
+        let res = checker.check(&wallets).await.unwrap();
+        assert_eq!(res.sol, Some(1.0));
     }
 }
